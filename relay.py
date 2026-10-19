@@ -26,8 +26,13 @@ DEFAULT_SEEDS = (
     "onion4zr3bsdeaelksemwokl5qmxd5o7jyblf46vc2mfl6cozgw77tqd.onion,"
     "kn4u2xxl2otoo2ujv3mhehwfwbw7mtppaf56fu3nxogvv7eekf2qdrid.onion,"
     "zqdx5x7pfybox7m5rz3fe5kiouxhipvh3ekuteq2urrrvwcxjttnmgid.onion,"
+    "puqjsmsyyzmxjdtcgr2fl4wrdazqd2phaqrz26alzwyletbvekkxhyyd.onion,"
+    "ch4s5llfqshxbvba2yulgp5kbopq25w3qqrtli67sle6smbujlebn2id.onion,"
     "7bntuiegd3stvcylvx7rhnhq7ncasxiokunbf5onvvm34dg5gccvooid.onion,"
-    "jz6urt6ckkqqvtasm6bll2mryhksjcawcl4tbguif5nqvxgsfsx6ywad.onion"
+    "jz6urt6ckkqqvtasm6bll2mryhksjcawcl4tbguif5nqvxgsfsx6ywad.onion,"
+    "4wufywh2k6ayyz6nmh2w25hj5vjsqgkve24o2tthvc7rhyvxnhaghqqd.onion,"
+    "nwsoa6ddtbbqbwcceanhhj3j23d5a47zbpbs6zspz5zoeytzqpzvkqqd.onion,"
+    "bk7iegv3v232ycjyf5ylwsdx42iozvy2dhhff5zn3ciwa3g2lkifdlad.onion"
 )
 
 # Zero-Trust Memory, Format & Topology Limits (Anti-Sybil & Anti-DoS)
@@ -52,8 +57,6 @@ DEPRECATED_SEEDS = {
     "kn4u2ef3y7ecyvbh36fkezxbbjrkc67ddtsf7m2dyrcpfdba7t2c5jad.onion",
     "zqdx5vye5tnc2b5ffj3ufc255wucx2z3b2bfvnefdn3g2ef5z2x67nad.onion",
     "dkkwnbju5xxhd5rrdg7sbxmh5fyoh7loew6mpaxb5xjjckimk6rt63ad.onion",
-    "puqjsmsyyzmxjdtcgr2fl4wrdazqd2phaqrz26alzwyletbvekkxhyyd.onion",
-    "ch4s5llfqshxbvba2yulgp5kbopq25w3qqrtli67sle6smbujlebn2id.onion",
 }
 _raw_seeds = (DEFAULT_SEEDS + "," + os.getenv("BOOTSTRAP_SEEDS", "")).split(",")
 BOOTSTRAP_SEEDS = list(dict.fromkeys(
@@ -149,6 +152,38 @@ NODE_GEO_METADATA = {
         "lat": 49.2,
         "lon": 2.3522,
         "role": "🇫🇷 Cloud Relay (Paris, FR)"
+    },
+    "jz6urt6ckkqqvtasm6bll2mryhksjcawcl4tbguif5nqvxgsfsx6ywad.onion": {
+        "node_name": "🌐 Nó 7 — Google Cloud (US-East)",
+        "location": "Moncks Corner, SC, EUA (us-east1-b)",
+        "provider": "Google Cloud Platform (e2-micro Free Tier)",
+        "lat": 33.1960,
+        "lon": -80.0131,
+        "role": "🌐 Cloud Relay (GCP US-East)"
+    },
+    "4wufywh2k6ayyz6nmh2w25hj5vjsqgkve24o2tthvc7rhyvxnhaghqqd.onion": {
+        "node_name": "⚡ Nó 8 — Render Cloud (Ohio)",
+        "location": "Columbus, Ohio, EUA (us-east)",
+        "provider": "Render Cloud (Free Web Service)",
+        "lat": 39.9612,
+        "lon": -82.9988,
+        "role": "⚡ Cloud Relay (Render Ohio)"
+    },
+    "nwsoa6ddtbbqbwcceanhhj3j23d5a47zbpbs6zspz5zoeytzqpzvkqqd.onion": {
+        "node_name": "🇷🇺 Nó 9 — Amvera Cloud (Moscou)",
+        "location": "Moscou, Rússia (msk1)",
+        "provider": "Amvera Cloud (RU Container PaaS)",
+        "lat": 55.7558,
+        "lon": 37.6173,
+        "role": "🇷🇺 Cloud Relay (Moscou, RU)"
+    },
+    "bk7iegv3v232ycjyf5ylwsdx42iozvy2dhhff5zn3ciwa3g2lkifdlad.onion": {
+        "node_name": "🐳 Nó 10 — Back4App Cloud (US-East)",
+        "location": "US-East (Back4App Containers), EUA",
+        "provider": "Back4App Containers (AWS us-east)",
+        "lat": 38.9519,
+        "lon": -77.4480,
+        "role": "🐳 Cloud Relay (Back4App)"
     }
 }
 custom_peer_geo = {}
@@ -1096,12 +1131,14 @@ def bootstrap_discovery_loop():
                                 try:
                                     p_health = session.get(f"http://{p_clean}/health", timeout=25)
                                     if p_health.status_code == 200:
-                                        p_pk = (p_health.json().get("node_pubkey") or "").strip().lower()
-                                        if PUBKEY_HEX_REGEX.match(p_pk):
+                                        p_body = p_health.json()
+                                        p_pk = (p_body.get("node_pubkey") or "").strip().lower()
+                                        if p_body.get("status") == "healthy":
                                             with lock:
                                                 if len(known_peers) < MAX_KNOWN_PEERS:
                                                     known_peers.add(p_clean)
-                                                    peer_pubkeys[p_clean] = p_pk
+                                                    if PUBKEY_HEX_REGEX.match(p_pk):
+                                                        peer_pubkeys[p_clean] = p_pk
                                 except Exception:
                                     pass
                     print(
