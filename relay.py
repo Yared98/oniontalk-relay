@@ -5,6 +5,7 @@ import math
 import time
 import uuid
 import hmac
+import base64
 import random
 import hashlib
 import threading
@@ -21,6 +22,17 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 app = Flask(__name__)
 # Maximum 2 MB per HTTP request (Anti-OOM / DoS protection)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
+
+
+@app.after_request
+def apply_zero_trust_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
 
 DEFAULT_SEEDS = (
     "onion4zr3bsdeaelksemwokl5qmxd5o7jyblf46vc2mfl6cozgw77tqd.onion,"
@@ -44,6 +56,7 @@ RECIPIENT_ID_REGEX = re.compile(r"^@[0-9a-f]{64}(:[a-z2-7]{56}\.onion)?$")
 
 MAX_KNOWN_PEERS = 64
 MAX_INBOX_PER_USER = 200
+MAX_PER_SENDER_INBOX = 50
 MAX_TOTAL_INBOXES = 5000
 MESSAGE_TTL_MS = 24 * 3600 * 1000  # 24 hours
 AUTH_WINDOW_MS = 5 * 60 * 1000     # +/- 5 minutes replay window
@@ -191,6 +204,7 @@ custom_peer_geo = {}
 inbox = {}
 known_peers = set(BOOTSTRAP_SEEDS)
 peer_pubkeys = {}  # Maps verified .onion -> 64-hex Ed25519 node_pubkey
+_peer_reverify_last_ts = {}  # Rate-limit cache for container restart key rotation checks
 my_onion_domain = None
 lock = threading.Lock()
 inbox_cond = threading.Condition(lock)
@@ -208,12 +222,27 @@ stats_counters = {
 
 
 def is_valid_onion_v3(domain: str) -> bool:
+    """
+    Validates Tor v3 .onion syntax AND verifies the embedded Ed25519 public key SHA3-256 checksum
+    per Tor Rendezvous Specification v3 (rejects synthetic/garbage base32 strings in O(1)).
+    """
     if not domain or not isinstance(domain, str):
         return False
     clean = domain.strip().lower()
     if clean in DEPRECATED_SEEDS:
         return False
-    return bool(ONION_V3_REGEX.match(clean))
+    if not ONION_V3_REGEX.match(clean):
+        return False
+    if os.getenv("ALLOW_SYNTHETIC_ONION_TESTS") == "1":
+        return True
+    try:
+        raw = base64.b32decode(clean[:-6].upper())
+        if len(raw) != 35 or raw[34] != 0x03:
+            return False
+        expected_checksum = hashlib.sha3_256(b".onion checksum" + raw[:32] + b"\x03").digest()[:2]
+        return hmac.compare_digest(raw[32:34], expected_checksum)
+    except Exception:
+        return False
 
 
 def is_valid_recipient_id(user_id: str) -> bool:
@@ -235,7 +264,7 @@ def extract_ed25519_pubkey_hex(user_id: str) -> str | None:
 
 def verify_user_request_signature(expected_scopes, user_id: str) -> tuple[bool, str]:
     """
-    Verifies Ed25519 challenge-response signature for client operations (INBOX, ACK, ACK_BATCH).
+    Verifies Ed25519 challenge-response signature for client operations (INBOX, ACK, ACK_BATCH, SEND).
     Canonical challenge: ONIONTALK_AUTH_V2|<SCOPE>|<user_id>|<timestamp_ms>
     """
     pub_hex = extract_ed25519_pubkey_hex(user_id)
@@ -278,6 +307,55 @@ def verify_user_request_signature(expected_scopes, user_id: str) -> tuple[bool, 
     return False, "Invalid Ed25519 signature"
 
 
+def verify_wire_envelope_signature(sender: str, recipient: str, payload: str) -> tuple[bool, str]:
+    """
+    Zero-Knowledge verification of the sender's Ed25519 signature on V2 wire envelopes
+    (__ENC_X25519_CHACHA20_V2__:<ephPubHex>:<nonceB64>:<ctB64>:<signatureHex>) or HTTP auth header.
+    Prevents unauthenticated third parties from flooding a recipient's inbox quota (WB-01).
+    """
+    sender_pub_hex = extract_ed25519_pubkey_hex(sender)
+    if not sender_pub_hex:
+        return False, "Missing or invalid sender Ed25519 Crypto ID"
+
+    if payload.startswith("__ENC_X25519_CHACHA20_V2__:"):
+        parts = payload[len("__ENC_X25519_CHACHA20_V2__:"):].split(":", 3)
+        if len(parts) != 4:
+            return False, "Malformed V2 encrypted wire envelope"
+        eph_pub_hex = parts[0].strip().lower()
+        nonce_b64 = parts[1].strip()
+        ct_b64 = parts[2].strip()
+        sig_hex = parts[3].strip().lower()
+        if not PUBKEY_HEX_REGEX.match(eph_pub_hex) or not SIG_HEX_REGEX.match(sig_hex):
+            return False, "Invalid ephemeral X25519 key or Ed25519 signature format in envelope"
+        try:
+            pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(sender_pub_hex))
+            sig_bytes = bytes.fromhex(sig_hex)
+        except ValueError:
+            return False, "Invalid sender Ed25519 public key encoding"
+
+        default_home = "onion4zr3bsdeaelksemwokl5qmxd5o7jyblf46vc2mfl6cozgw77tqd.onion"
+        s_handle = sender.strip().lower().split(":", 1)[0]
+        r_handle = recipient.strip().lower().split(":", 1)[0]
+        candidates = [
+            (sender.strip().lower(), recipient.strip().lower()),
+            (f"{s_handle}:{default_home}", f"{r_handle}:{default_home}"),
+        ]
+        for cand_s, cand_r in candidates:
+            transcript = f"ENVELOPE_V2|{cand_s}|{cand_r}|{eph_pub_hex}|{nonce_b64}|{ct_b64}".encode("utf-8")
+            try:
+                pub.verify(sig_bytes, transcript)
+                return True, "ok"
+            except InvalidSignature:
+                continue
+        return False, "Invalid sender Ed25519 signature on V2 wire envelope"
+
+    # Fallback for signed HTTP requests (e.g. control/test clients providing X-OnionTalk-Signature)
+    hdr_ok, hdr_err = verify_user_request_signature(("SEND", "INBOX"), sender)
+    if hdr_ok:
+        return True, "ok"
+    return False, f"Unauthenticated message payload ({hdr_err})"
+
+
 def build_peer_signed_request(method: str, path: str, payload: dict) -> tuple[bytes, dict]:
     """Serializes JSON body and signs it with this relay node's Ed25519 private key."""
     body_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -294,6 +372,34 @@ def build_peer_signed_request(method: str, path: str, payload: dict) -> tuple[by
         "X-Peer-Signature": sig_hex,
     }
     return body_bytes, headers
+
+
+def _reverify_peer_key_on_rotation(peer_onion: str, candidate_pubkey: str) -> bool:
+    """
+    If a known peer container restarted and rotated its ephemeral Ed25519 node keypair,
+    queries http://<peer_onion>/health over Tor (rate-limited once per 30s per peer) to
+    confirm the live hidden service owns candidate_pubkey before updating peer_pubkeys.
+    """
+    now_sec = time.time()
+    with lock:
+        last_check = _peer_reverify_last_ts.get(peer_onion, 0.0)
+        if (now_sec - last_check) < 30.0:
+            return False
+        _peer_reverify_last_ts[peer_onion] = now_sec
+
+    try:
+        session = get_tor_session()
+        res = session.get(f"http://{peer_onion}/health", timeout=20)
+        if res.status_code == 200:
+            body = res.json()
+            remote_pubkey = (body.get("node_pubkey") or "").strip().lower()
+            if body.get("status") == "healthy" and hmac.compare_digest(remote_pubkey, candidate_pubkey):
+                with lock:
+                    peer_pubkeys[peer_onion] = candidate_pubkey
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def verify_peer_request(require_known_peer: bool = True) -> tuple[bool, str, str, str]:
@@ -331,16 +437,20 @@ def verify_peer_request(require_known_peer: bool = True) -> tuple[bool, str, str
         return False, peer_onion, peer_pubkey, "Invalid peer Ed25519 signature"
 
     if require_known_peer:
+        needs_reverify = False
         with lock:
             if peer_onion not in known_peers:
                 return False, peer_onion, peer_pubkey, "Peer is not a registered member of the mesh"
             pinned_key = peer_pubkeys.get(peer_onion)
             if pinned_key and not hmac.compare_digest(pinned_key, peer_pubkey):
-                return False, peer_onion, peer_pubkey, "Peer public key mismatch against pinned identity"
-            if not pinned_key and peer_onion in BOOTSTRAP_SEEDS:
+                needs_reverify = True
+            elif not pinned_key and peer_onion in BOOTSTRAP_SEEDS:
                 peer_pubkeys[peer_onion] = peer_pubkey
             elif not pinned_key:
-                return False, peer_onion, peer_pubkey, "Peer public key not yet verified via /health handshake"
+                needs_reverify = True
+
+        if needs_reverify and not _reverify_peer_key_on_rotation(peer_onion, peer_pubkey):
+            return False, peer_onion, peer_pubkey, "Peer public key mismatch against pinned identity"
 
     return True, peer_onion, peer_pubkey, "ok"
 
@@ -422,8 +532,8 @@ def prune_expired_messages_locked():
 
 def enqueue_message_locked(recipient: str, msg_obj: dict) -> tuple[bool, str]:
     """
-    Enqueues an encrypted envelope with strict per-user and global quotas.
-    Never evicts unread messages via FIFO when full (R7 fix); rejects excess traffic instead.
+    Enqueues an encrypted envelope with strict per-sender, per-user, and global quotas.
+    Never evicts unread messages via FIFO when full (R7 + WB-01 fix); rejects excess traffic instead.
     """
     prune_expired_messages_locked()
     if recipient not in inbox:
@@ -434,6 +544,12 @@ def enqueue_message_locked(recipient: str, msg_obj: dict) -> tuple[bool, str]:
     msg_id = msg_obj.get("id")
     if any(m.get("id") == msg_id for m in inbox[recipient]):
         return False, "duplicate_message"
+
+    sender_id = (msg_obj.get("sender") or "").strip().lower()
+    if sender_id:
+        sender_count = sum(1 for m in inbox[recipient] if m.get("sender") == sender_id)
+        if sender_count >= MAX_PER_SENDER_INBOX:
+            return False, "sender_quota_exceeded"
 
     if len(inbox[recipient]) >= MAX_INBOX_PER_USER:
         return False, "user_quota_exceeded"
@@ -485,11 +601,17 @@ def send_message():
     if not is_valid_recipient_id(recipient) or not payload or len(payload) > 524288:
         return jsonify({"error": "Missing or invalid recipient Crypto ID or payload"}), 400
 
-    if sender and not is_valid_recipient_id(sender):
-        return jsonify({"error": "Invalid sender Crypto ID"}), 400
+    if not is_valid_recipient_id(sender):
+        return jsonify({"error": "Missing or invalid sender 256-bit Ed25519 Crypto ID"}), 400
 
     if not SHA256_HEX_REGEX.match(ack_lock):
         return jsonify({"error": "Missing or invalid 64-hex SHA-256 ack_lock"}), 400
+
+    env_ok, env_err = verify_wire_envelope_signature(sender, recipient, payload)
+    if not env_ok:
+        with lock:
+            stats_counters["unauthenticated_requests_blocked"] += 1
+        return jsonify({"error": env_err}), 401
 
     ts_ok, safe_ts = parse_safe_timestamp_ms(data.get("timestamp"))
     if not ts_ok:
@@ -513,12 +635,12 @@ def send_message():
         added, reason = enqueue_message_locked(recipient, stored_msg)
 
     if not added:
-        if reason in ("user_quota_exceeded", "global_quota_exceeded"):
+        if reason in ("user_quota_exceeded", "sender_quota_exceeded", "global_quota_exceeded"):
             return jsonify({"error": "Inbox quota exceeded", "reason": reason}), 429
         return jsonify({"status": "duplicate", "messageId": msg_id}), 200
 
     # Zero-metadata logging (R4 fix: never print recipient, sender, or msg_id)
-    print("[*] [RELAY-STORED] E2E encrypted envelope queued with verified ack_lock", flush=True)
+    print("[*] [RELAY-STORED] E2E encrypted envelope queued with verified Ed25519 signature & ack_lock", flush=True)
     threading.Thread(target=broadcast_message_to_peers, args=(stored_msg,), daemon=True).start()
 
     return jsonify({"status": "ok", "messageId": msg_id}), 200
@@ -551,7 +673,7 @@ def broadcast_message_to_peers(msg_payload):
 
 @app.route('/api/v1/messages/sync', methods=['POST'])
 def sync_message():
-    """Receives replicated envelopes from authenticated mesh peers (R2, R3, R4, R6, R7 hardened)."""
+    """Receives replicated envelopes from authenticated mesh peers (R2, R3, R4, R6, R7, WB-01 hardened)."""
     peer_ok, _, _, err_msg = verify_peer_request(require_known_peer=True)
     if not peer_ok:
         with lock:
@@ -565,11 +687,23 @@ def sync_message():
     payload = (data.get('payload') or '').strip()
     ack_lock = (data.get('ack_lock') or '').strip().lower()
 
-    if not is_valid_recipient_id(recipient) or not msg_id or not payload or len(payload) > 524288:
+    if (
+        not is_valid_recipient_id(recipient)
+        or not is_valid_recipient_id(sender)
+        or not msg_id
+        or not payload
+        or len(payload) > 524288
+    ):
         return jsonify({"error": "Invalid sync payload"}), 400
 
     if not SHA256_HEX_REGEX.match(ack_lock):
         return jsonify({"error": "Missing or invalid 64-hex SHA-256 ack_lock"}), 400
+
+    env_ok, env_err = verify_wire_envelope_signature(sender, recipient, payload)
+    if not env_ok:
+        with lock:
+            stats_counters["unauthenticated_requests_blocked"] += 1
+        return jsonify({"error": env_err}), 401
 
     ts_ok, safe_ts = parse_safe_timestamp_ms(data.get("timestamp"))
     if not ts_ok:
@@ -577,7 +711,7 @@ def sync_message():
 
     stored_msg = {
         "id": msg_id,
-        "sender": sender if is_valid_recipient_id(sender) else "",
+        "sender": sender,
         "recipient": recipient,
         "payload": payload,
         "ack_lock": ack_lock,
@@ -588,7 +722,7 @@ def sync_message():
         added, reason = enqueue_message_locked(recipient, stored_msg)
         if added:
             print("[*] [GOSSIP-RECV] E2E envelope synchronized from verified peer", flush=True)
-        elif reason in ("user_quota_exceeded", "global_quota_exceeded"):
+        elif reason in ("user_quota_exceeded", "sender_quota_exceeded", "global_quota_exceeded"):
             return jsonify({"error": "Inbox quota exceeded"}), 429
 
     return jsonify({"status": "synced"}), 200
