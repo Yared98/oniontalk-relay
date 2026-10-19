@@ -197,7 +197,7 @@ def extract_ed25519_pubkey_hex(user_id: str) -> str | None:
     return None
 
 
-def verify_user_request_signature(expected_scope: str, user_id: str) -> tuple[bool, str]:
+def verify_user_request_signature(expected_scopes, user_id: str) -> tuple[bool, str]:
     """
     Verifies Ed25519 challenge-response signature for client operations (INBOX, ACK, ACK_BATCH).
     Canonical challenge: ONIONTALK_AUTH_V2|<SCOPE>|<user_id>|<timestamp_ms>
@@ -220,13 +220,21 @@ def verify_user_request_signature(expected_scope: str, user_id: str) -> tuple[bo
     if abs(now_ms - ts_ms) > AUTH_WINDOW_MS:
         return False, "Authentication timestamp outside replay window"
 
-    challenge = f"ONIONTALK_AUTH_V2|{expected_scope.upper()}|{user_id.strip().lower()}|{ts_ms}".encode("utf-8")
+    scopes = (expected_scopes,) if isinstance(expected_scopes, str) else tuple(expected_scopes)
     try:
         pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(pub_hex))
-        pub.verify(bytes.fromhex(sig_hex), challenge)
-        return True, "ok"
-    except (InvalidSignature, ValueError):
-        return False, "Invalid Ed25519 signature"
+        sig_bytes = bytes.fromhex(sig_hex)
+    except ValueError:
+        return False, "Invalid Ed25519 key or signature encoding"
+
+    for sc in scopes:
+        challenge = f"ONIONTALK_AUTH_V2|{sc.upper()}|{user_id.strip().lower()}|{ts_ms}".encode("utf-8")
+        try:
+            pub.verify(sig_bytes, challenge)
+            return True, "ok"
+        except InvalidSignature:
+            continue
+    return False, "Invalid Ed25519 signature"
 
 
 def build_peer_signed_request(method: str, path: str, payload: dict) -> tuple[bytes, dict]:
@@ -639,7 +647,7 @@ def acknowledge_messages_batch():
     if not user or not isinstance(acks_list, list) or not acks_list:
         return jsonify({"error": "Missing user or acks list"}), 400
 
-    auth_ok, auth_err = verify_user_request_signature("ACK_BATCH", user)
+    auth_ok, auth_err = verify_user_request_signature(("ACK", "ACK_BATCH"), user)
     if not auth_ok:
         with lock:
             stats_counters["unauthenticated_requests_blocked"] += 1
