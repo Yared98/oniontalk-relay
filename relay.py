@@ -26,9 +26,8 @@ DEFAULT_SEEDS = (
     "onion4zr3bsdeaelksemwokl5qmxd5o7jyblf46vc2mfl6cozgw77tqd.onion,"
     "kn4u2xxl2otoo2ujv3mhehwfwbw7mtppaf56fu3nxogvv7eekf2qdrid.onion,"
     "zqdx5x7pfybox7m5rz3fe5kiouxhipvh3ekuteq2urrrvwcxjttnmgid.onion,"
-    "puqjsmsyyzmxjdtcgr2fl4wrdazqd2phaqrz26alzwyletbvekkxhyyd.onion,"
-    "ch4s5llfqshxbvba2yulgp5kbopq25w3qqrtli67sle6smbujlebn2id.onion,"
-    "7bntuiegd3stvcylvx7rhnhq7ncasxiokunbf5onvvm34dg5gccvooid.onion"
+    "7bntuiegd3stvcylvx7rhnhq7ncasxiokunbf5onvvm34dg5gccvooid.onion,"
+    "jz6urt6ckkqqvtasm6bll2mryhksjcawcl4tbguif5nqvxgsfsx6ywad.onion"
 )
 
 # Zero-Trust Memory, Format & Topology Limits (Anti-Sybil & Anti-DoS)
@@ -53,6 +52,8 @@ DEPRECATED_SEEDS = {
     "kn4u2ef3y7ecyvbh36fkezxbbjrkc67ddtsf7m2dyrcpfdba7t2c5jad.onion",
     "zqdx5vye5tnc2b5ffj3ufc255wucx2z3b2bfvnefdn3g2ef5z2x67nad.onion",
     "dkkwnbju5xxhd5rrdg7sbxmh5fyoh7loew6mpaxb5xjjckimk6rt63ad.onion",
+    "puqjsmsyyzmxjdtcgr2fl4wrdazqd2phaqrz26alzwyletbvekkxhyyd.onion",
+    "ch4s5llfqshxbvba2yulgp5kbopq25w3qqrtli67sle6smbujlebn2id.onion",
 }
 _raw_seeds = (DEFAULT_SEEDS + "," + os.getenv("BOOTSTRAP_SEEDS", "")).split(",")
 BOOTSTRAP_SEEDS = list(dict.fromkeys(
@@ -227,13 +228,18 @@ def verify_user_request_signature(expected_scopes, user_id: str) -> tuple[bool, 
     except ValueError:
         return False, "Invalid Ed25519 key or signature encoding"
 
+    clean_uid = user_id.strip().lower()
     for sc in scopes:
-        challenge = f"ONIONTALK_AUTH_V2|{sc.upper()}|{user_id.strip().lower()}|{ts_ms}".encode("utf-8")
-        try:
-            pub.verify(sig_bytes, challenge)
-            return True, "ok"
-        except InvalidSignature:
-            continue
+        sc_up = sc.upper()
+        for challenge_str in (
+            f"ONIONTALK_AUTH_V2|{sc_up}|{clean_uid}|{ts_ms}",
+            f"{sc_up}|{clean_uid}|{ts_ms}",
+        ):
+            try:
+                pub.verify(sig_bytes, challenge_str.encode("utf-8"))
+                return True, "ok"
+            except InvalidSignature:
+                continue
     return False, "Invalid Ed25519 signature"
 
 
