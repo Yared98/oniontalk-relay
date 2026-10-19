@@ -1,6 +1,6 @@
 services:
   tor-daemon:
-    image: osminogin/tor-simple:latest
+    image: osminogin/tor-simple:0.4.8.12
     container_name: oniontalk-tor
     restart: unless-stopped
     volumes:
@@ -14,7 +14,7 @@ services:
     container_name: oniontalk-relay
     restart: unless-stopped
     ports:
-      - "${RELAY_PORT:-8080}:8080"
+      - "127.0.0.1:${RELAY_PORT:-8080}:8080"
     environment:
       - TOR_HOSTNAME_FILE=/var/lib/tor/hidden_service/hostname
       - TOR_SOCKS_PROXY=socks5h://tor-daemon:9050
