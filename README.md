@@ -4,6 +4,9 @@
   <p><strong>Zero-Knowledge Tor v3 Hidden Service Relay with Ed25519-Authenticated Peer Exchange (PEX) & Cryptographic ACK Preimage Lock</strong></p>
 
   <p>
+    <a href="https://play.google.com/store/apps/details?id=org.oniontalk.messenger">
+      <img src="https://img.shields.io/badge/Google_Play-OnionTalk_–_Apps_no_Google_Play-3DDC84?style=for-the-badge&logo=google-play&logoColor=black" alt="OnionTalk – Apps no Google Play" />
+    </a>
     <a href="https://github.com/sponsors/eriktonon">
       <img src="https://img.shields.io/badge/Sponsor-OnionTalk-ea4aaa?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="Sponsor on GitHub" />
     </a>
