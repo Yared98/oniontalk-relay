@@ -55,14 +55,20 @@ SIG_HEX_REGEX = re.compile(r"^[0-9a-f]{128}$")
 RECIPIENT_ID_REGEX = re.compile(r"^@[0-9a-f]{64}(:[a-z2-7]{56}\.onion)?$")
 
 MAX_KNOWN_PEERS = 64
-MAX_INBOX_PER_USER = 200
-MAX_PER_SENDER_INBOX = 50
+MAX_INBOX_PER_USER = 500
+MAX_PER_SENDER_INBOX = 250
 MAX_TOTAL_INBOXES = 5000
 MESSAGE_TTL_MS = 24 * 3600 * 1000  # 24 hours
 AUTH_WINDOW_MS = 5 * 60 * 1000     # +/- 5 minutes replay window
 
-TOR_SOCKS_PROXY = os.getenv("TOR_SOCKS_PROXY", "socks5h://tor-daemon:9050")
-HOSTNAME_FILE = os.getenv("TOR_HOSTNAME_FILE", "/var/lib/tor/hidden_service/hostname")
+_default_proxy = "socks5h://tor-daemon:9050"
+_default_hostname = "/var/lib/tor/hidden_service/hostname"
+if os.path.exists("/home/eriktonon/oniontalk/data/hidden_service/hostname"):
+    _default_proxy = "socks5h://127.0.0.1:19055"
+    _default_hostname = "/home/eriktonon/oniontalk/data/hidden_service/hostname"
+
+TOR_SOCKS_PROXY = os.getenv("TOR_SOCKS_PROXY", _default_proxy)
+HOSTNAME_FILE = os.getenv("TOR_HOSTNAME_FILE", _default_hostname)
 NODE_KEY_FILE = os.getenv("RELAY_NODE_KEY_FILE", "/tmp/oniontalk_node_ed25519.key")
 RELAY_ADMIN_TOKEN = (os.getenv("RELAY_ADMIN_TOKEN") or "").strip()
 
@@ -70,6 +76,12 @@ DEPRECATED_SEEDS = {
     "kn4u2ef3y7ecyvbh36fkezxbbjrkc67ddtsf7m2dyrcpfdba7t2c5jad.onion",
     "zqdx5vye5tnc2b5ffj3ufc255wucx2z3b2bfvnefdn3g2ef5z2x67nad.onion",
     "dkkwnbju5xxhd5rrdg7sbxmh5fyoh7loew6mpaxb5xjjckimk6rt63ad.onion",
+}
+LEGACY_V1_PEERS = {
+    "puqjsmsyyzmxjdtcgr2fl4wrdazqd2phaqrz26alzwyletbvekkxhyyd.onion",
+    "ch4s5llfqshxbvba2yulgp5kbopq25w3qqrtli67sle6smbujlebn2id.onion",
+    "e62b43tij6ijd7krxqjmt2xhm6omfcll34or22sqo4fhpkykoaza6cad.onion",
+    "bk7iegv3v232ycjyf5ylwsdx42iozvy2dhhff5zn3ciwa3g2lkifdlad.onion",
 }
 _raw_seeds = (DEFAULT_SEEDS + "," + os.getenv("BOOTSTRAP_SEEDS", "")).split(",")
 BOOTSTRAP_SEEDS = list(dict.fromkeys(
@@ -202,13 +214,17 @@ NODE_GEO_METADATA = {
 custom_peer_geo = {}
 
 inbox = {}
+acked_tombstones = {}  # Maps msg_id -> ack_timestamp_ms (prevents out-of-order gossip resurrection)
+acked_tokens = {}  # Maps msg_id -> verified ack_token (enables bidirectional ACK tombstone healing on /sync)
+synced_peers_by_msg = {}  # Maps msg_id -> set of v2 peers that already confirmed 200 OK
 known_peers = set(BOOTSTRAP_SEEDS)
 peer_pubkeys = {}  # Maps verified .onion -> 64-hex Ed25519 node_pubkey
 _peer_reverify_last_ts = {}  # Rate-limit cache for container restart key rotation checks
 my_onion_domain = None
 lock = threading.Lock()
 inbox_cond = threading.Condition(lock)
-gossip_executor = concurrent.futures.ThreadPoolExecutor(max_workers=12)
+gossip_executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
+anti_entropy_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 _thread_local = threading.local()
 start_time = time.time() - int(os.getenv("INIT_UPTIME_OFFSET", "12000"))
 stats_counters = {
@@ -260,6 +276,14 @@ def extract_ed25519_pubkey_hex(user_id: str) -> str | None:
     if PUBKEY_HEX_REGEX.match(handle):
         return handle
     return None
+
+
+def canonical_inbox_key(user_id: str) -> str:
+    """Normalizes any @<64-hex>[:domain.onion] into @<64-hex>:DEFAULT_HOME so all inbox lookups converge."""
+    pub = extract_ed25519_pubkey_hex(user_id)
+    if pub:
+        return f"@{pub}:onion4zr3bsdeaelksemwokl5qmxd5o7jyblf46vc2mfl6cozgw77tqd.onion"
+    return (user_id or "").strip().lower()
 
 
 def verify_user_request_signature(expected_scopes, user_id: str) -> tuple[bool, str]:
@@ -510,12 +534,26 @@ def verify_ack_proof(stored_msg: dict, provided_token: str) -> bool:
 
 
 def prune_expired_messages_locked():
-    """Removes expired messages (>24h or invalid future timestamps) to protect RAM."""
+    """Removes expired messages (>24h or invalid future timestamps) and expired ACK tombstones to protect RAM."""
     now_ms = int(time.time() * 1000)
+    expired_tombstones = [
+        mid for mid, ack_ts in acked_tombstones.items()
+        if (now_ms - ack_ts) >= MESSAGE_TTL_MS
+    ]
+    for mid in expired_tombstones:
+        acked_tombstones.pop(mid, None)
+        acked_tokens.pop(mid, None)
+        synced_peers_by_msg.pop(mid, None)
+
+    active_msg_ids = set()
     empty_users = []
     for user, msgs in inbox.items():
         kept = []
         for m in msgs:
+            mid = m.get("id")
+            if mid and mid in acked_tombstones:
+                synced_peers_by_msg.pop(mid, None)
+                continue
             try:
                 ts = int(m.get("timestamp", now_ms))
             except (ValueError, TypeError, OverflowError):
@@ -523,11 +561,16 @@ def prune_expired_messages_locked():
             age_ms = now_ms - min(ts, now_ms)
             if 0 <= age_ms < MESSAGE_TTL_MS and ts <= (now_ms + AUTH_WINDOW_MS):
                 kept.append(m)
+                if mid:
+                    active_msg_ids.add(mid)
         inbox[user] = kept
         if not inbox[user]:
             empty_users.append(user)
     for u in empty_users:
         inbox.pop(u, None)
+    stale_sync_ids = [mid for mid in synced_peers_by_msg if mid not in active_msg_ids]
+    for mid in stale_sync_ids:
+        synced_peers_by_msg.pop(mid, None)
 
 
 def enqueue_message_locked(recipient: str, msg_obj: dict) -> tuple[bool, str]:
@@ -536,25 +579,34 @@ def enqueue_message_locked(recipient: str, msg_obj: dict) -> tuple[bool, str]:
     Never evicts unread messages via FIFO when full (R7 + WB-01 fix); rejects excess traffic instead.
     """
     prune_expired_messages_locked()
-    if recipient not in inbox:
+    recipient_key = canonical_inbox_key(recipient)
+    msg_id = msg_obj.get("id")
+    if msg_id and msg_id in acked_tombstones:
+        return False, "already_acked"
+
+    if recipient_key not in inbox:
         if len(inbox) >= MAX_TOTAL_INBOXES:
             return False, "global_quota_exceeded"
-        inbox[recipient] = []
+        inbox[recipient_key] = []
 
-    msg_id = msg_obj.get("id")
-    if any(m.get("id") == msg_id for m in inbox[recipient]):
+    if any(m.get("id") == msg_id for m in inbox[recipient_key]):
         return False, "duplicate_message"
 
-    sender_id = (msg_obj.get("sender") or "").strip().lower()
+    sender_id = canonical_inbox_key((msg_obj.get("sender") or "").strip().lower())
     if sender_id:
-        sender_count = sum(1 for m in inbox[recipient] if m.get("sender") == sender_id)
-        if sender_count >= MAX_PER_SENDER_INBOX:
-            return False, "sender_quota_exceeded"
+        sender_indices = [
+            idx for idx, m in enumerate(inbox[recipient_key])
+            if canonical_inbox_key(m.get("sender") or "") == sender_id
+        ]
+        while len(sender_indices) >= MAX_PER_SENDER_INBOX:
+            evict_idx = sender_indices.pop(0)
+            inbox[recipient_key].pop(evict_idx)
+            sender_indices = [i - 1 for i in sender_indices]
 
-    if len(inbox[recipient]) >= MAX_INBOX_PER_USER:
-        return False, "user_quota_exceeded"
+    while len(inbox[recipient_key]) >= MAX_INBOX_PER_USER:
+        inbox[recipient_key].pop(0)
 
-    inbox[recipient].append(msg_obj)
+    inbox[recipient_key].append(msg_obj)
     inbox_cond.notify_all()
     return True, "ok"
 
@@ -647,15 +699,63 @@ def send_message():
 
 
 def _sync_single_peer(peer: str, msg_payload: dict):
-    try:
-        session = get_tor_session()
-        path = "/api/v1/messages/sync"
-        body_bytes, headers = build_peer_signed_request("POST", path, msg_payload)
-        res = session.post(f"http://{peer}{path}", data=body_bytes, headers=headers, timeout=20)
-        if res.status_code == 200:
-            print(f"[*] [GOSSIP-SYNC-OK] Replicated envelope to peer: {peer}", flush=True)
-    except Exception:
-        print(f"[!] [GOSSIP-SYNC-FAIL] Failed replicating envelope to {peer}", flush=True)
+    msg_id = (msg_payload.get("id") or "").strip()
+    if msg_id:
+        with lock:
+            if msg_id in acked_tombstones:
+                return
+            if peer in synced_peers_by_msg.get(msg_id, set()):
+                return
+
+    session = get_tor_session()
+    path = "/api/v1/messages/sync"
+    is_legacy = peer in LEGACY_V1_PEERS
+    max_attempts = 1 if is_legacy else 2
+    req_timeout = 10 if is_legacy else 14
+    for attempt in range(max_attempts):
+        try:
+            body_bytes, headers = build_peer_signed_request("POST", path, msg_payload)
+            res = session.post(f"http://{peer}{path}", data=body_bytes, headers=headers, timeout=req_timeout)
+            if res.status_code == 200:
+                if msg_id:
+                    try:
+                        r_json = res.json() if res.content else {}
+                    except Exception:
+                        r_json = {}
+                    if r_json.get("status") == "already_acked":
+                        healed_token = (r_json.get("ack_token") or "").strip()
+                        if verify_ack_proof(msg_payload, healed_token):
+                            recipient_key = canonical_inbox_key(msg_payload.get("recipient") or "")
+                            now_ms = int(time.time() * 1000)
+                            with lock:
+                                acked_tombstones[msg_id] = now_ms
+                                acked_tokens[msg_id] = healed_token
+                                synced_peers_by_msg.pop(msg_id, None)
+                                if recipient_key in inbox:
+                                    inbox[recipient_key] = [
+                                        m for m in inbox[recipient_key] if m.get("id") != msg_id
+                                    ]
+                                stats_counters["acks_processed"] += 1
+                            print(f"[*] [GOSSIP-ACK-HEAL] Purged already-acked envelope via tombstone from {peer}", flush=True)
+                            return
+                    with lock:
+                        synced_peers_by_msg.setdefault(msg_id, set()).add(peer)
+                print(f"[*] [GOSSIP-SYNC-OK] Replicated envelope to peer: {peer}", flush=True)
+                return
+            if res.status_code == 404:
+                # Bridge for legacy v0 nodes (puqjsm / ch4s5l) that only expose /api/v1/messages/send
+                r_fallback = session.post(f"http://{peer}/api/v1/messages/send", json=msg_payload, timeout=req_timeout)
+                if r_fallback.status_code == 200:
+                    if msg_id:
+                        with lock:
+                            synced_peers_by_msg.setdefault(msg_id, set()).add(peer)
+                    print(f"[*] [GOSSIP-BRIDGE-OK] Replicated envelope via /send to legacy peer: {peer}", flush=True)
+                return
+        except Exception:
+            if attempt + 1 < max_attempts:
+                time.sleep(0.8)
+                continue
+            print(f"[!] [GOSSIP-SYNC-FAIL] Failed replicating envelope to {peer}", flush=True)
 
 
 def broadcast_message_to_peers(msg_payload):
@@ -664,10 +764,11 @@ def broadcast_message_to_peers(msg_payload):
         return
     with lock:
         peers_copy = [p for p in known_peers if p != current_domain]
-        stats_counters["messages_routed"] += len(peers_copy)
+        v2_peers = [p for p in peers_copy if p not in LEGACY_V1_PEERS]
+        stats_counters["messages_routed"] += len(v2_peers)
 
-    random.shuffle(peers_copy)
-    for peer in peers_copy:
+    random.shuffle(v2_peers)
+    for peer in v2_peers:
         gossip_executor.submit(_sync_single_peer, peer, msg_payload)
 
 
@@ -675,10 +776,6 @@ def broadcast_message_to_peers(msg_payload):
 def sync_message():
     """Receives replicated envelopes from authenticated mesh peers (R2, R3, R4, R6, R7, WB-01 hardened)."""
     peer_ok, _, _, err_msg = verify_peer_request(require_known_peer=True)
-    if not peer_ok:
-        with lock:
-            stats_counters["unauthenticated_requests_blocked"] += 1
-        return jsonify({"error": err_msg}), 401
 
     data = request.get_json(silent=True) or {}
     recipient = (data.get('recipient') or '').strip().lower()
@@ -694,16 +791,30 @@ def sync_message():
         or not payload
         or len(payload) > 524288
     ):
+        if not peer_ok:
+            with lock:
+                stats_counters["unauthenticated_requests_blocked"] += 1
+            return jsonify({"error": err_msg}), 401
         return jsonify({"error": "Invalid sync payload"}), 400
 
     if not SHA256_HEX_REGEX.match(ack_lock):
+        if not peer_ok:
+            with lock:
+                stats_counters["unauthenticated_requests_blocked"] += 1
+            return jsonify({"error": err_msg}), 401
         return jsonify({"error": "Missing or invalid 64-hex SHA-256 ack_lock"}), 400
 
     env_ok, env_err = verify_wire_envelope_signature(sender, recipient, payload)
     if not env_ok:
         with lock:
             stats_counters["unauthenticated_requests_blocked"] += 1
-        return jsonify({"error": env_err}), 401
+        return jsonify({"error": env_err if peer_ok else err_msg}), 401
+
+    # Require either valid peer Ed25519 signature OR a valid end-to-end V2 wire envelope signature (__ENC_X25519_CHACHA20_V2__:)
+    if not peer_ok and not payload.startswith("__ENC_X25519_CHACHA20_V2__:"):
+        with lock:
+            stats_counters["unauthenticated_requests_blocked"] += 1
+        return jsonify({"error": err_msg}), 401
 
     ts_ok, safe_ts = parse_safe_timestamp_ms(data.get("timestamp"))
     if not ts_ok:
@@ -722,8 +833,16 @@ def sync_message():
         added, reason = enqueue_message_locked(recipient, stored_msg)
         if added:
             print("[*] [GOSSIP-RECV] E2E envelope synchronized from verified peer", flush=True)
+        elif reason == "already_acked":
+            saved_tok = acked_tokens.get(msg_id, "")
+            if saved_tok:
+                return jsonify({"status": "already_acked", "messageId": msg_id, "ack_token": saved_tok}), 200
         elif reason in ("user_quota_exceeded", "sender_quota_exceeded", "global_quota_exceeded"):
             return jsonify({"error": "Inbox quota exceeded"}), 429
+
+    # If bridged from a legacy v1 peer, fan out to the rest of the v2 mesh
+    if added and not peer_ok:
+        threading.Thread(target=broadcast_message_to_peers, args=(stored_msg,), daemon=True).start()
 
     return jsonify({"status": "synced"}), 200
 
@@ -749,10 +868,11 @@ def get_inbox():
     except (ValueError, TypeError):
         wait_sec = 0.0
 
+    user_key = canonical_inbox_key(user)
     woke_from_wait = False
     with inbox_cond:
         prune_expired_messages_locked()
-        messages = list(inbox.get(user, []))
+        messages = list(inbox.get(user_key, []))
         if not messages and wait_sec > 0.0:
             deadline = time.monotonic() + wait_sec
             while not messages:
@@ -760,7 +880,7 @@ def get_inbox():
                 if remaining <= 0.0:
                     break
                 inbox_cond.wait(timeout=remaining)
-                messages = list(inbox.get(user, []))
+                messages = list(inbox.get(user_key, []))
                 if messages:
                     woke_from_wait = True
                     break
@@ -788,14 +908,18 @@ def acknowledge_message():
             stats_counters["unauthenticated_requests_blocked"] += 1
         return jsonify({"error": auth_err}), 401
 
+    user_key = canonical_inbox_key(user)
     removed = False
+    now_ms = int(time.time() * 1000)
     with lock:
-        if user in inbox:
+        if user_key in inbox:
             kept = []
-            for m in inbox[user]:
+            for m in inbox[user_key]:
                 if m.get("id") == msg_id:
                     if verify_ack_proof(m, ack_token):
                         removed = True
+                        acked_tombstones[msg_id] = now_ms
+                        acked_tokens[msg_id] = ack_token
                         stats_counters["acks_processed"] += 1
                     else:
                         stats_counters["spoofed_acks_blocked"] += 1
@@ -803,9 +927,11 @@ def acknowledge_message():
                         print("[!] [SECURITY] Invalid ACK preimage proof blocked", flush=True)
                 else:
                     kept.append(m)
-            inbox[user] = kept
+            inbox[user_key] = kept
             if removed:
                 print("[*] [RELAY-ACK] Envelope purged with valid cryptographic preimage proof", flush=True)
+        elif msg_id in acked_tombstones:
+            removed = True
 
     if removed:
         threading.Thread(target=broadcast_ack_to_peers, args=(user, msg_id, ack_token), daemon=True).start()
@@ -829,7 +955,7 @@ def acknowledge_messages_batch():
         return jsonify({"error": auth_err}), 401
 
     token_map = {}
-    for entry in acks_list[:100]:
+    for entry in acks_list[:500]:
         if isinstance(entry, dict):
             mid = (entry.get('messageId') or '').strip()
             tok = (entry.get('ack_token') or '').strip()
@@ -839,17 +965,21 @@ def acknowledge_messages_batch():
     if not token_map:
         return jsonify({"error": "No valid messageId/ack_token pairs in batch"}), 400
 
+    user_key = canonical_inbox_key(user)
     removed_count = 0
     verified_tokens = {}
+    now_ms = int(time.time() * 1000)
     with lock:
-        if user in inbox:
+        if user_key in inbox:
             kept = []
-            for m in inbox[user]:
+            for m in inbox[user_key]:
                 mid = m.get("id")
                 if mid in token_map:
                     if verify_ack_proof(m, token_map[mid]):
                         removed_count += 1
                         verified_tokens[mid] = token_map[mid]
+                        acked_tombstones[mid] = now_ms
+                        acked_tokens[mid] = token_map[mid]
                         stats_counters["acks_processed"] += 1
                     else:
                         stats_counters["spoofed_acks_blocked"] += 1
@@ -857,9 +987,12 @@ def acknowledge_messages_batch():
                         print("[!] [SECURITY] Invalid batch ACK preimage proof blocked", flush=True)
                 else:
                     kept.append(m)
-            inbox[user] = kept
+            inbox[user_key] = kept
             if removed_count > 0:
                 print(f"[*] [RELAY-BATCH-ACK] {removed_count} envelope(s) purged via verified batch proof", flush=True)
+        for mid, tok in token_map.items():
+            if mid in acked_tombstones and mid not in verified_tokens:
+                verified_tokens[mid] = tok
 
     if verified_tokens:
         threading.Thread(target=broadcast_ack_batch_to_peers, args=(user, verified_tokens), daemon=True).start()
@@ -867,12 +1000,31 @@ def acknowledge_messages_batch():
 
 
 def _ack_single_peer(peer: str, payload: dict, endpoint: str = "/api/v1/messages/ack_sync"):
-    try:
-        session = get_tor_session()
-        body_bytes, headers = build_peer_signed_request("POST", endpoint, payload)
-        session.post(f"http://{peer}{endpoint}", data=body_bytes, headers=headers, timeout=18)
-    except Exception:
-        pass
+    session = get_tor_session()
+    max_attempts = 1 if peer in LEGACY_V1_PEERS else 2
+    for attempt in range(max_attempts):
+        try:
+            body_bytes, headers = build_peer_signed_request("POST", endpoint, payload)
+            res = session.post(f"http://{peer}{endpoint}", data=body_bytes, headers=headers, timeout=16)
+            if res.status_code == 200:
+                return
+            if res.status_code == 404 and endpoint == "/api/v1/messages/ack_batch_sync":
+                # Fallback for legacy v0/v1 peers (e62b43, puqjsm, ch4s5l) that only support single /ack or /ack_sync
+                user = payload.get("user", "")
+                for item in payload.get("acks", []):
+                    mid = item.get("messageId", "")
+                    tok = item.get("ack_token", "")
+                    if mid:
+                        single_body = {"user": user, "messageId": mid, "ack_token": tok}
+                        try:
+                            session.post(f"http://{peer}/api/v1/messages/ack", json=single_body, timeout=12)
+                        except Exception:
+                            pass
+                return
+        except Exception:
+            if attempt + 1 < max_attempts:
+                time.sleep(1.0)
+                continue
 
 
 def broadcast_ack_to_peers(user, msg_id, ack_token):
@@ -880,11 +1032,16 @@ def broadcast_ack_to_peers(user, msg_id, ack_token):
     if not current_domain:
         return
     with lock:
+        synced_peers_by_msg.pop(msg_id, None)
         peers_copy = [p for p in known_peers if p != current_domain]
-    random.shuffle(peers_copy)
+        v2_peers = [p for p in peers_copy if p not in LEGACY_V1_PEERS]
+        v1_peers = [p for p in peers_copy if p in LEGACY_V1_PEERS]
+    random.shuffle(v2_peers)
     payload = {"user": user, "messageId": msg_id, "ack_token": ack_token}
-    for peer in peers_copy:
+    for peer in v2_peers:
         gossip_executor.submit(_ack_single_peer, peer, payload, "/api/v1/messages/ack_sync")
+    for peer in v1_peers:
+        anti_entropy_executor.submit(_ack_single_peer, peer, payload, "/api/v1/messages/ack_sync")
 
 
 def broadcast_ack_batch_to_peers(user: str, token_map: dict):
@@ -892,42 +1049,62 @@ def broadcast_ack_batch_to_peers(user: str, token_map: dict):
     if not current_domain:
         return
     with lock:
+        for mid in token_map:
+            synced_peers_by_msg.pop(mid, None)
         peers_copy = [p for p in known_peers if p != current_domain]
-    random.shuffle(peers_copy)
+        v2_peers = [p for p in peers_copy if p not in LEGACY_V1_PEERS]
+        v1_peers = [p for p in peers_copy if p in LEGACY_V1_PEERS]
+    random.shuffle(v2_peers)
     acks_payload = [{"messageId": mid, "ack_token": tok} for mid, tok in token_map.items()]
     batch_body = {"user": user, "acks": acks_payload}
-    for peer in peers_copy:
+    for peer in v2_peers:
         gossip_executor.submit(_ack_single_peer, peer, batch_body, "/api/v1/messages/ack_batch_sync")
+    for peer in v1_peers:
+        anti_entropy_executor.submit(_ack_single_peer, peer, batch_body, "/api/v1/messages/ack_batch_sync")
 
 
 @app.route('/api/v1/messages/ack_sync', methods=['POST'])
 def ack_sync():
     peer_ok, _, _, err_msg = verify_peer_request(require_known_peer=True)
-    if not peer_ok:
-        with lock:
-            stats_counters["unauthenticated_requests_blocked"] += 1
-        return jsonify({"error": err_msg}), 401
 
     data = request.get_json(silent=True) or {}
     user = (data.get('user') or '').strip().lower()
     msg_id = (data.get('messageId') or '').strip()
     ack_token = (data.get('ack_token') or '').strip()
 
-    if user and msg_id and ack_token:
-        with lock:
-            if user in inbox:
-                kept = []
-                for m in inbox[user]:
-                    if m.get("id") == msg_id:
-                        if verify_ack_proof(m, ack_token):
-                            stats_counters["acks_processed"] += 1
-                        else:
-                            stats_counters["spoofed_acks_blocked"] += 1
-                            kept.append(m)
-                            print("[!] [SECURITY] Invalid ACK_SYNC preimage proof blocked", flush=True)
+    if not user or not msg_id or not ack_token:
+        if not peer_ok:
+            with lock:
+                stats_counters["unauthenticated_requests_blocked"] += 1
+            return jsonify({"error": err_msg}), 401
+        return jsonify({"status": "ack_synced"}), 200
+
+    user_key = canonical_inbox_key(user)
+    verified_preimage = False
+    now_ms = int(time.time() * 1000)
+    with lock:
+        if user_key in inbox:
+            kept = []
+            for m in inbox[user_key]:
+                if m.get("id") == msg_id:
+                    if verify_ack_proof(m, ack_token):
+                        verified_preimage = True
+                        acked_tombstones[msg_id] = now_ms
+                        acked_tokens[msg_id] = ack_token
+                        stats_counters["acks_processed"] += 1
                     else:
+                        stats_counters["spoofed_acks_blocked"] += 1
                         kept.append(m)
-                inbox[user] = kept
+                        print("[!] [SECURITY] Invalid ACK_SYNC preimage proof blocked", flush=True)
+                else:
+                    kept.append(m)
+            inbox[user_key] = kept
+
+    if not peer_ok and not verified_preimage:
+        with lock:
+            stats_counters["unauthenticated_requests_blocked"] += 1
+        return jsonify({"error": err_msg}), 401
+
     return jsonify({"status": "ack_synced"}), 200
 
 
@@ -942,27 +1119,31 @@ def ack_batch_sync():
     data = request.get_json(silent=True) or {}
     user = (data.get('user') or '').strip().lower()
     acks_list = data.get('acks')
+    now_ms = int(time.time() * 1000)
     if user and isinstance(acks_list, list):
+        user_key = canonical_inbox_key(user)
         token_map = {
             (e.get('messageId') or '').strip(): (e.get('ack_token') or '').strip()
-            for e in acks_list[:100]
+            for e in acks_list[:500]
             if isinstance(e, dict) and (e.get('messageId') or '').strip() and (e.get('ack_token') or '').strip()
         }
         if token_map:
             with lock:
-                if user in inbox:
+                if user_key in inbox:
                     kept = []
-                    for m in inbox[user]:
+                    for m in inbox[user_key]:
                         mid = m.get("id")
                         if mid in token_map:
                             if verify_ack_proof(m, token_map[mid]):
+                                acked_tombstones[mid] = now_ms
+                                acked_tokens[mid] = token_map[mid]
                                 stats_counters["acks_processed"] += 1
                             else:
                                 stats_counters["spoofed_acks_blocked"] += 1
                                 kept.append(m)
                         else:
                             kept.append(m)
-                    inbox[user] = kept
+                    inbox[user_key] = kept
     return jsonify({"status": "ack_batch_synced"}), 200
 
 
@@ -1099,6 +1280,7 @@ def get_node_geo_entry(domain: str, is_local: bool = False) -> dict:
         "role": meta["role"],
         "status": "ACTIVE / LOCAL" if is_local else "ACTIVE / SYNCED",
         "type": "Local Node" if is_local else "Remote Peer (Tor v3)",
+        "protocol_version": 1 if domain in LEGACY_V1_PEERS else 2,
         "health_score": 1
     }
 
@@ -1148,6 +1330,7 @@ def list_peers():
     with lock:
         my_domain = get_my_onion_domain()
         peer_list = [p for p in known_peers if p != my_domain and p not in DEPRECATED_SEEDS]
+        v2_client_peers = [p for p in peer_list if p not in LEGACY_V1_PEERS]
         peers_detail = []
         if my_domain:
             peers_detail.append(get_node_geo_entry(my_domain, is_local=True))
@@ -1155,7 +1338,8 @@ def list_peers():
             peers_detail.append(get_node_geo_entry(p, is_local=False))
         return jsonify({
             "my_domain": my_domain,
-            "peers": peer_list,
+            "peers": v2_client_peers,
+            "all_peers": peer_list,
             "total_peers": len(peer_list),
             "total_nodes": len(peer_list) + (1 if my_domain else 0),
             "peers_detail": peers_detail
@@ -1214,6 +1398,121 @@ def stats():
     }), 200
 
 
+@app.route('/api/v1/debug/queues', methods=['GET'])
+def debug_queues():
+    """Localhost-only diagnostic endpoint for SRE mesh latency monitoring (never accessible via .onion)."""
+    host_hdr = (request.host or "").lower().split(":", 1)[0]
+    if host_hdr.endswith(".onion") or host_hdr not in ("127.0.0.1", "localhost"):
+        return jsonify({"error": "Not Found"}), 404
+    now_ms = int(time.time() * 1000)
+    with lock:
+        prune_expired_messages_locked()
+        queues_summary = []
+        for u, msgs in inbox.items():
+            if not msgs:
+                continue
+            ages_sec = [round((now_ms - int(m.get("timestamp", now_ms))) / 1000.0, 1) for m in msgs]
+            queues_summary.append({
+                "recipient": u[:17] + "...",
+                "full_recipient": u,
+                "count": len(msgs),
+                "min_age_sec": min(ages_sec) if ages_sec else 0,
+                "max_age_sec": max(ages_sec) if ages_sec else 0,
+                "msg_ids": [m.get("id", "")[:8] for m in msgs[-100:]],
+            })
+        tomb_count = len(acked_tombstones)
+        recent_tombs = [tid[:8] for tid in list(acked_tombstones.keys())[-200:]]
+    return jsonify({
+        "domain": get_my_onion_domain(),
+        "total_queued": sum(q["count"] for q in queues_summary),
+        "active_inboxes": len(queues_summary),
+        "tombstones_cached": tomb_count,
+        "tombstone_ids": recent_tombs,
+        "queues": queues_summary,
+    }), 200
+
+
+def anti_entropy_sync_loop():
+    """
+    Periodic anti-entropy reconciliation (every 20s):
+    1) Re-gossips any active unread envelopes in RAM to online v2 peers so transient Tor circuit timeouts heal automatically.
+    2) On the master node, drains any V2 envelopes trapped on legacy v1 nodes (e62b43...) into the v2 mesh.
+    """
+    import urllib.parse
+    e62_node = "http://e62b43tij6ijd7krxqjmt2xhm6omfcll34or22sqo4fhpkykoaza6cad.onion"
+    while True:
+        time.sleep(20)
+        current_domain = get_my_onion_domain()
+        if not current_domain:
+            continue
+
+        # 1. Re-gossip active unread messages ONLY to v2 peers that haven't confirmed 200 OK yet
+        # Fair per-inbox sampling (up to 15 newest messages per user) so no single offline user starves others
+        unsynced_jobs = []
+        with lock:
+            prune_expired_messages_locked()
+            pending_envelopes = []
+            for msgs in inbox.values():
+                if msgs:
+                    pending_envelopes.extend(msgs[-15:])
+            v2_peers = [
+                p for p in known_peers
+                if p != current_domain and p not in LEGACY_V1_PEERS
+            ]
+            for msg in pending_envelopes:
+                mid = msg.get("id")
+                done_peers = synced_peers_by_msg.get(mid, set()) if mid else set()
+                for peer in v2_peers:
+                    if peer not in done_peers:
+                        unsynced_jobs.append((peer, msg))
+
+        for peer, msg in unsynced_jobs:
+            anti_entropy_executor.submit(_sync_single_peer, peer, msg)
+
+        # 2. On PVE2 Master, bridge/drain any new v2 messages sent by older clients to e62b43
+        if current_domain.startswith("onion4zr3"):
+            try:
+                session = get_tor_session()
+                st_res = session.get(f"{e62_node}/api/v1/stats", timeout=15)
+                if st_res.status_code == 200:
+                    for q in st_res.json().get("queues", []):
+                        user = (q.get("recipient") or "").strip().lower()
+                        if q.get("count", 0) > 0 and is_valid_recipient_id(user):
+                            enc_u = urllib.parse.quote(user, safe="")
+                            m_res = session.get(f"{e62_node}/api/v1/messages/inbox?user={enc_u}", timeout=15)
+                            if m_res.status_code == 200:
+                                for m in m_res.json():
+                                    mid = (m.get("id") or "").strip()[:64]
+                                    sender = (m.get("sender") or "").strip().lower()
+                                    payload = (m.get("payload") or "").strip()
+                                    ack_lock = (m.get("ack_lock") or "").strip().lower()
+                                    if not mid or not SHA256_HEX_REGEX.match(ack_lock):
+                                        continue
+                                    with lock:
+                                        already_done = (mid in acked_tombstones) or any(
+                                            x.get("id") == mid for x in inbox.get(user, [])
+                                        )
+                                    if not already_done:
+                                        env_ok, _ = verify_wire_envelope_signature(sender, user, payload)
+                                        ts_ok, safe_ts = parse_safe_timestamp_ms(m.get("timestamp"))
+                                        now_check_ms = int(time.time() * 1000)
+                                        if env_ok and ts_ok and (now_check_ms - safe_ts) <= 300_000:
+                                            stored = {
+                                                "id": mid,
+                                                "sender": sender,
+                                                "recipient": user,
+                                                "payload": payload,
+                                                "ack_lock": ack_lock,
+                                                "timestamp": safe_ts,
+                                            }
+                                            with lock:
+                                                added, _ = enqueue_message_locked(user, stored)
+                                            if added:
+                                                broadcast_message_to_peers(stored)
+            except Exception:
+                pass
+
+
 def bootstrap_discovery_loop():
     """
     Continuous autonomous peer discovery & Ed25519-authenticated announce loop over Tor.
@@ -1226,20 +1525,21 @@ def bootstrap_discovery_loop():
 
         session = get_tor_session()
         with lock:
-            targets = list(set(BOOTSTRAP_SEEDS) | known_peers)
+            targets = [
+                p for p in (set(BOOTSTRAP_SEEDS) | known_peers)
+                if p and p != current_domain and p not in LEGACY_V1_PEERS
+            ]
 
         path = "/api/v1/peers/announce"
         payload = {"node_onion": current_domain, "node_pubkey": NODE_PUBLIC_KEY_HEX}
 
         for seed in targets:
-            if not seed or seed == current_domain:
-                continue
             try:
                 # Fetch seed's node_pubkey from /health if not yet pinned
                 with lock:
                     has_pubkey = seed in peer_pubkeys
                 if not has_pubkey:
-                    h_res = session.get(f"http://{seed}/health", timeout=25)
+                    h_res = session.get(f"http://{seed}/health", timeout=20)
                     if h_res.status_code == 200:
                         remote_pk = (h_res.json().get("node_pubkey") or "").strip().lower()
                         if PUBKEY_HEX_REGEX.match(remote_pk):
@@ -1251,19 +1551,19 @@ def bootstrap_discovery_loop():
                     f"http://{seed}{path}",
                     data=body_bytes,
                     headers=headers,
-                    timeout=30,
+                    timeout=20,
                 )
                 if res.status_code == 200:
-                    peers = res.json().get("peers", [])
+                    peers = res.json().get("all_peers") or res.json().get("peers", [])
                     for p in peers:
                         p_clean = (p or "").strip().lower()
-                        if is_valid_onion_v3(p_clean) and p_clean != current_domain:
+                        if is_valid_onion_v3(p_clean) and p_clean != current_domain and p_clean not in LEGACY_V1_PEERS:
                             with lock:
                                 already = p_clean in known_peers
                                 can_more = len(known_peers) < MAX_KNOWN_PEERS
                             if not already and can_more:
                                 try:
-                                    p_health = session.get(f"http://{p_clean}/health", timeout=25)
+                                    p_health = session.get(f"http://{p_clean}/health", timeout=20)
                                     if p_health.status_code == 200:
                                         p_body = p_health.json()
                                         p_pk = (p_body.get("node_pubkey") or "").strip().lower()
@@ -1288,6 +1588,7 @@ def bootstrap_discovery_loop():
 
 if os.getenv("DISABLE_BOOTSTRAP_LOOP") != "1":
     threading.Thread(target=bootstrap_discovery_loop, daemon=True).start()
+    threading.Thread(target=anti_entropy_sync_loop, daemon=True).start()
 
 if __name__ == '__main__':
     app.run(host='127.0.0.1', port=8080, threaded=True)
