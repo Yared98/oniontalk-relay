@@ -44,7 +44,10 @@ DEFAULT_SEEDS = (
     "jz6urt6ckkqqvtasm6bll2mryhksjcawcl4tbguif5nqvxgsfsx6ywad.onion,"
     "4wufywh2k6ayyz6nmh2w25hj5vjsqgkve24o2tthvc7rhyvxnhaghqqd.onion,"
     "nwsoa6ddtbbqbwcceanhhj3j23d5a47zbpbs6zspz5zoeytzqpzvkqqd.onion,"
-    "bk7iegv3v232ycjyf5ylwsdx42iozvy2dhhff5zn3ciwa3g2lkifdlad.onion"
+    "hdjp7uaj4qemlmwtev7xmj2w3uexnv6ctplfgvbmpqxenbfgwjjwtrid.onion,"
+    "gcvfh67zltoyvithw6luetsrcec6cw42upzrsprxfmx27cvh7vidw4yd.onion,"
+    "bk7iegv3v232ycjyf5ylwsdx42iozvy2dhhff5zn3ciwa3g2lkifdlad.onion,"
+    "wfi3nwuzk2tgrsf2scdy4nb6x6rtiocit4n26477zdlvdvshkgip3ayd.onion"
 )
 
 # Zero-Trust Memory, Format & Topology Limits (Anti-Sybil & Anti-DoS)
@@ -76,6 +79,7 @@ DEPRECATED_SEEDS = {
     "kn4u2ef3y7ecyvbh36fkezxbbjrkc67ddtsf7m2dyrcpfdba7t2c5jad.onion",
     "zqdx5vye5tnc2b5ffj3ufc255wucx2z3b2bfvnefdn3g2ef5z2x67nad.onion",
     "dkkwnbju5xxhd5rrdg7sbxmh5fyoh7loew6mpaxb5xjjckimk6rt63ad.onion",
+    "e62b43tij6ijd7krxqjmt2xhm6omfcll34or22sqo4fhpkykoaza6cad.onion",
 }
 LEGACY_V1_PEERS = {
     "puqjsmsyyzmxjdtcgr2fl4wrdazqd2phaqrz26alzwyletbvekkxhyyd.onion",
@@ -132,70 +136,79 @@ NODE_PRIVATE_KEY, NODE_PUBLIC_KEY_HEX = _load_or_create_node_keypair()
 NODE_GEO_METADATA = {
     "onion4zr3bsdeaelksemwokl5qmxd5o7jyblf46vc2mfl6cozgw77tqd.onion": {
         "node_name": "👑 Nó 1 — PVE2 Master (SP)",
+        "map_label": "👑 N1 • PVE2",
         "location": "São Paulo, Brasil",
         "provider": "Proxmox VE (Homelab PVE2)",
-        "lat": -20.8,
-        "lon": -46.6333,
+        "lat": -18.5,
+        "lon": -45.5,
         "role": "👑 Seed Node (Master)"
     },
     "kn4u2xxl2otoo2ujv3mhehwfwbw7mtppaf56fu3nxogvv7eekf2qdrid.onion": {
         "node_name": "🖥️ Nó 2 — PVE4 Worker (SP)",
+        "map_label": "🖥️ N2 • PVE4",
         "location": "São Paulo, Brasil",
         "provider": "Proxmox VE (Homelab PVE4)",
-        "lat": -24.2,
-        "lon": -46.5200,
+        "lat": -23.5,
+        "lon": -41.5,
         "role": "🖥️ Homelab Relay (PVE4)"
     },
     "puqjsmsyyzmxjdtcgr2fl4wrdazqd2phaqrz26alzwyletbvekkxhyyd.onion": {
         "node_name": "☁️ Nó 3 — AWS EKS (US-East)",
+        "map_label": "☁️ N3 • EKS",
         "location": "US-East (AWS EKS), EUA",
         "provider": "Amazon Web Services (EKS)",
-        "lat": 40.8,
-        "lon": -77.0364,
+        "lat": 43.2,
+        "lon": -73.5,
         "role": "☁️ Cloud Relay (AWS EKS)"
     },
     "zqdx5x7pfybox7m5rz3fe5kiouxhipvh3ekuteq2urrrvwcxjttnmgid.onion": {
         "node_name": "🟧 Nó 4 — Oracle OCI (Vinhedo)",
+        "map_label": "🟧 N4 • OCI",
         "location": "Vinhedo / SP, Brasil (sa-saopaulo-1)",
         "provider": "Oracle Cloud (OCI Always Free)",
-        "lat": -27.6,
-        "lon": -46.9753,
+        "lat": -28.5,
+        "lon": -49.5,
         "role": "🟧 Cloud Relay (Oracle OCI)"
     },
     "ch4s5llfqshxbvba2yulgp5kbopq25w3qqrtli67sle6smbujlebn2id.onion": {
         "node_name": "☁️ Nó 5 — AWS Virginia",
+        "map_label": "☁️ N5 • Virginia",
         "location": "Ashburn, Virginia, EUA (us-east-1)",
         "provider": "Amazon Web Services (us-east-1)",
-        "lat": 36.8,
-        "lon": -77.4874,
+        "lat": 37.5,
+        "lon": -75.5,
         "role": "☁️ Cloud Relay (AWS Virginia)"
     },
     "7bntuiegd3stvcylvx7rhnhq7ncasxiokunbf5onvvm34dg5gccvooid.onion": {
         "node_name": "🇫🇷 Nó 6 — Alwaysdata (Paris)",
+        "map_label": "🇫🇷 N6 • Paris #1",
         "location": "Paris, França (EU-West)",
         "provider": "Alwaysdata Cloud (AS60362 Paris)",
-        "lat": 49.2,
-        "lon": 2.3522,
+        "lat": 50.5,
+        "lon": 1.8,
         "role": "🇫🇷 Cloud Relay (Paris, FR)"
     },
     "jz6urt6ckkqqvtasm6bll2mryhksjcawcl4tbguif5nqvxgsfsx6ywad.onion": {
         "node_name": "🌐 Nó 7 — Google Cloud (US-East)",
+        "map_label": "🌐 N7 • GCP SC",
         "location": "Moncks Corner, SC, EUA (us-east1-b)",
         "provider": "Google Cloud Platform (e2-micro Free Tier)",
-        "lat": 33.1960,
-        "lon": -80.0131,
+        "lat": 31.8,
+        "lon": -81.2,
         "role": "🌐 Cloud Relay (GCP US-East)"
     },
     "4wufywh2k6ayyz6nmh2w25hj5vjsqgkve24o2tthvc7rhyvxnhaghqqd.onion": {
         "node_name": "⚡ Nó 8 — Render Cloud (Ohio)",
+        "map_label": "⚡ N8 • Ohio",
         "location": "Columbus, Ohio, EUA (us-east)",
         "provider": "Render Cloud (Free Web Service)",
-        "lat": 39.9612,
-        "lon": -82.9988,
+        "lat": 41.5,
+        "lon": -85.5,
         "role": "⚡ Cloud Relay (Render Ohio)"
     },
     "nwsoa6ddtbbqbwcceanhhj3j23d5a47zbpbs6zspz5zoeytzqpzvkqqd.onion": {
         "node_name": "🇷🇺 Nó 9 — Amvera Cloud (Moscou)",
+        "map_label": "🇷🇺 N9 • Moscou",
         "location": "Moscou, Rússia (msk1)",
         "provider": "Amvera Cloud (RU Container PaaS)",
         "lat": 55.7558,
@@ -204,11 +217,39 @@ NODE_GEO_METADATA = {
     },
     "bk7iegv3v232ycjyf5ylwsdx42iozvy2dhhff5zn3ciwa3g2lkifdlad.onion": {
         "node_name": "🐳 Nó 10 — Back4App Cloud (US-East)",
+        "map_label": "🐳 N10 • Back4App",
         "location": "US-East (Back4App Containers), EUA",
         "provider": "Back4App Containers (AWS us-east)",
-        "lat": 38.9519,
-        "lon": -77.4480,
+        "lat": 35.5,
+        "lon": -89.5,
         "role": "🐳 Cloud Relay (Back4App)"
+    },
+    "hdjp7uaj4qemlmwtev7xmj2w3uexnv6ctplfgvbmpqxenbfgwjjwtrid.onion": {
+        "node_name": "🇫🇷 Nó 11 — Alwaysdata Paris #2 (Yared)",
+        "map_label": "🇫🇷 N11 • Paris #2",
+        "location": "Paris, França (EU-West #2)",
+        "provider": "Alwaysdata Cloud (AS60362 Paris #2)",
+        "lat": 46.8,
+        "lon": -1.5,
+        "role": "🇫🇷 Cloud Relay (Paris #2, FR)"
+    },
+    "gcvfh67zltoyvithw6luetsrcec6cw42upzrsprxfmx27cvh7vidw4yd.onion": {
+        "node_name": "🇫🇷 Nó 12 — Alwaysdata Paris #3 (Default)",
+        "map_label": "🇫🇷 N12 • Paris #3",
+        "location": "Paris, França (EU-West #3)",
+        "provider": "Alwaysdata Cloud (AS60362 Paris #3)",
+        "lat": 44.2,
+        "lon": 5.2,
+        "role": "🇫🇷 Cloud Relay (Paris #3, FR)"
+    },
+    "wfi3nwuzk2tgrsf2scdy4nb6x6rtiocit4n26477zdlvdvshkgip3ayd.onion": {
+        "node_name": "🟦 Nó 13 — Northflank (US-Central)",
+        "map_label": "🟦 N13 • Northflank",
+        "location": "Council Bluffs, Iowa, EUA (US-Central)",
+        "provider": "Northflank Cloud (US-Central Relay)",
+        "lat": 41.8,
+        "lon": -98.5,
+        "role": "🟦 Cloud Relay (Northflank US-Central)"
     }
 }
 custom_peer_geo = {}
@@ -1273,6 +1314,7 @@ def get_node_geo_entry(domain: str, is_local: bool = False) -> dict:
     return {
         "domain": domain,
         "node_name": meta["node_name"],
+        "map_label": meta.get("map_label", meta["node_name"]),
         "location": meta["location"],
         "provider": meta["provider"],
         "lat": float(meta["lat"]),
