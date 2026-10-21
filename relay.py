@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 import re
 import json
@@ -47,7 +48,11 @@ DEFAULT_SEEDS = (
     "hdjp7uaj4qemlmwtev7xmj2w3uexnv6ctplfgvbmpqxenbfgwjjwtrid.onion,"
     "gcvfh67zltoyvithw6luetsrcec6cw42upzrsprxfmx27cvh7vidw4yd.onion,"
     "bk7iegv3v232ycjyf5ylwsdx42iozvy2dhhff5zn3ciwa3g2lkifdlad.onion,"
-    "wfi3nwuzk2tgrsf2scdy4nb6x6rtiocit4n26477zdlvdvshkgip3ayd.onion"
+    "wfi3nwuzk2tgrsf2scdy4nb6x6rtiocit4n26477zdlvdvshkgip3ayd.onion,"
+    "5s6w6556f2eov2p6wlsuavaxh7si2kaswjwi5reojnovbzemducjzjqd.onion,"
+    "o5yf3eukrwpt2g6jfo4q2y23xtuhoso2qknmnn6ac5eng5t4yt36roqd.onion,"
+    "o5zqqfl5znzexdojfnxgub5jnjelxdahbyxasjp57sx6fbxtjeqovpad.onion,"
+    "2amizuhb3p5x2lk3sra7f7thm5tgs7qtnysgowqpmexcqi4cuwyv7vad.onion"
 )
 
 # Zero-Trust Memory, Format & Topology Limits (Anti-Sybil & Anti-DoS)
@@ -250,6 +255,42 @@ NODE_GEO_METADATA = {
         "lat": 41.8,
         "lon": -98.5,
         "role": "🟦 Cloud Relay (Northflank US-Central)"
+    },
+    "5s6w6556f2eov2p6wlsuavaxh7si2kaswjwi5reojnovbzemducjzjqd.onion": {
+        "node_name": "🇯🇵 Nó 14 — DOM Cloud (Osaka, Japão)",
+        "map_label": "🇯🇵 N14 • Osaka",
+        "location": "Osaka, Japão (AP-Northeast)",
+        "provider": "DOM Cloud (osk.domcloud.co)",
+        "lat": 34.6937,
+        "lon": 135.5023,
+        "role": "🇯🇵 Cloud Relay (Osaka, JP)"
+    },
+    "o5yf3eukrwpt2g6jfo4q2y23xtuhoso2qknmnn6ac5eng5t4yt36roqd.onion": {
+        "node_name": "🇸🇬 Nó 15 — DOM Cloud (Singapura)",
+        "map_label": "🇸🇬 N15 • Singapura",
+        "location": "Singapura (AP-Southeast)",
+        "provider": "DOM Cloud (sgp.domcloud.co)",
+        "lat": 1.3521,
+        "lon": 103.8198,
+        "role": "🇸🇬 Cloud Relay (Singapura, SG)"
+    },
+    "o5zqqfl5znzexdojfnxgub5jnjelxdahbyxasjp57sx6fbxtjeqovpad.onion": {
+        "node_name": "🇩🇪 Nó 16 — DOM Cloud (Alemanha)",
+        "map_label": "🇩🇪 N16 • Alemanha",
+        "location": "Nuremberg, Alemanha (EU-Central)",
+        "provider": "DOM Cloud (nue.domcloud.co)",
+        "lat": 49.4521,
+        "lon": 11.0767,
+        "role": "🇩🇪 Cloud Relay (Nuremberg, DE)"
+    },
+    "2amizuhb3p5x2lk3sra7f7thm5tgs7qtnysgowqpmexcqi4cuwyv7vad.onion": {
+        "node_name": "🇨🇳 Nó 17 — ModelScope Cloud (China)",
+        "map_label": "🇨🇳 N17 • China",
+        "location": "Hangzhou, China (CN-East / Alibaba Cloud)",
+        "provider": "ModelScope Studios (Alibaba Cloud CN)",
+        "lat": 30.2741,
+        "lon": 120.1551,
+        "role": "🇨🇳 Cloud Relay (Hangzhou, CN)"
     }
 }
 custom_peer_geo = {}
@@ -1229,20 +1270,47 @@ def announce_peer():
         if current_domain and current_domain not in current_peers:
             current_peers.append(current_domain)
 
+    announced_geo = data.get("geo") if isinstance(data.get("geo"), dict) else None
     if peer_onion and not already_known and can_accept_more:
         threading.Thread(
             target=verify_and_register_peer,
-            args=(peer_onion, announced_pubkey),
+            args=(peer_onion, announced_pubkey, announced_geo),
             daemon=True,
         ).start()
+    elif peer_onion and already_known and announced_geo and peer_onion not in NODE_GEO_METADATA:
+        _apply_discovered_geo(peer_onion, announced_geo)
 
     return jsonify({"status": "registered", "peers": current_peers}), 200
 
 
-def verify_and_register_peer(candidate_onion: str, expected_pubkey: str):
+def _apply_discovered_geo(domain: str, raw_geo: dict):
+    if not isinstance(raw_geo, dict) or domain in NODE_GEO_METADATA:
+        return
+    coords_ok, safe_lat, safe_lon = parse_safe_coords(
+        raw_geo.get("lat", 0.0),
+        raw_geo.get("lon", 0.0),
+    )
+    if not coords_ok or (safe_lat == 0.0 and safe_lon == 0.0):
+        return
+    short_id = domain[:6]
+    node_name = str(raw_geo.get("node_name") or f"🛰️ Nó Auto-Join ({domain[:8]}...)")[:80]
+    map_label = str(raw_geo.get("map_label") or f"🛰️ Auto • {short_id}")[:32]
+    with lock:
+        custom_peer_geo[domain] = {
+            "node_name": node_name,
+            "map_label": map_label,
+            "location": str(raw_geo.get("location") or "Tor Hidden Service v3 (Auto-Join)")[:80],
+            "provider": str(raw_geo.get("provider") or "Federated P2P Node")[:80],
+            "lat": safe_lat,
+            "lon": safe_lon,
+            "role": str(raw_geo.get("role") or "🛰️ Auto-Discovered Relay")[:64],
+        }
+
+
+def verify_and_register_peer(candidate_onion: str, expected_pubkey: str, announced_geo: dict | None = None):
     """
-    Performs active handshake over Tor (/health) to verify both reachability
-    and cryptographic binding of candidate_onion -> expected_pubkey before registering.
+    Performs active handshake over Tor (/health) with retry backoff (up to 3 attempts)
+    to handle newly published Tor v3 HSDir descriptors and auto-registers peer + geo metadata.
     """
     if not is_valid_onion_v3(candidate_onion) or not PUBKEY_HEX_REGEX.match(expected_pubkey):
         return
@@ -1251,22 +1319,32 @@ def verify_and_register_peer(candidate_onion: str, expected_pubkey: str):
         return
 
     verified = False
-    try:
-        session = get_tor_session()
-        res = session.get(f"http://{candidate_onion}/health", timeout=25)
-        if res.status_code == 200:
-            body = res.json()
-            remote_pubkey = (body.get("node_pubkey") or "").strip().lower()
-            if body.get("status") == "healthy" and hmac.compare_digest(remote_pubkey, expected_pubkey):
-                verified = True
-    except Exception:
-        verified = False
+    remote_geo = announced_geo
+    for attempt in range(3):
+        try:
+            session = get_tor_session()
+            res = session.get(f"http://{candidate_onion}/health", timeout=25)
+            if res.status_code == 200:
+                body = res.json()
+                remote_pubkey = (body.get("node_pubkey") or "").strip().lower()
+                if isinstance(body.get("geo"), dict):
+                    remote_geo = body.get("geo")
+                if body.get("status") == "healthy" and hmac.compare_digest(remote_pubkey, expected_pubkey):
+                    verified = True
+                    break
+        except Exception:
+            verified = False
+        if attempt < 2:
+            time.sleep(8)
 
     if not verified:
         with lock:
             stats_counters["invalid_peers_blocked"] += 1
         print(f"[!] [ANTI-SYBIL] Unverified peer rejected: {candidate_onion}", flush=True)
         return
+
+    if remote_geo:
+        _apply_discovered_geo(candidate_onion, remote_geo)
 
     added = False
     with lock:
@@ -1286,9 +1364,12 @@ def gossip_new_peer(new_peer_onion: str, new_peer_pubkey: str):
         return
     with lock:
         targets = [p for p in known_peers if p != new_peer_onion and p != current_domain]
+        peer_geo = custom_peer_geo.get(new_peer_onion)
     session = get_tor_session()
     path = "/api/v1/peers/announce"
     payload = {"node_onion": new_peer_onion, "node_pubkey": new_peer_pubkey}
+    if peer_geo:
+        payload["geo"] = peer_geo
     for target in targets:
         try:
             body_bytes, headers = build_peer_signed_request("POST", path, payload)
@@ -1299,17 +1380,22 @@ def gossip_new_peer(new_peer_onion: str, new_peer_pubkey: str):
 
 def get_node_geo_entry(domain: str, is_local: bool = False) -> dict:
     meta = custom_peer_geo.get(domain) or NODE_GEO_METADATA.get(domain)
+    auto_discovered = 0 if domain in NODE_GEO_METADATA else 1
     if not meta:
+        # Deterministic, non-overlapping global coordinates when node location is unknown
         h = int(hashlib.sha256(domain.encode("utf-8")).hexdigest()[:8], 16)
-        fallback_lat = 47.3769 + ((h % 200) - 100) * 0.01
-        fallback_lon = 8.5417 + (((h >> 8) % 200) - 100) * 0.01
+        slot = h % 12
+        fallback_lat = -28.0 + (slot * 6.2) + (((h >> 8) % 20) - 10) * 0.1
+        fallback_lon = -31.0 + ((slot % 3) * 4.5) + (((h >> 16) % 20) - 10) * 0.1
+        short_id = domain[:6]
         meta = {
-            "node_name": f"🌐 Peer Dinâmico ({domain[:8]}...)",
-            "location": "Tor Hidden Service v3 (Auto-Discovered)",
-            "provider": "Federated P2P Node",
+            "node_name": f"🛰️ Nó Auto-Join ({domain[:8]}...)",
+            "map_label": f"🛰️ Auto • {short_id}",
+            "location": "Tor Hidden Service v3 (Localização Oculta / Auto-Join)",
+            "provider": "Tor v3 Mesh (Auto-Discovered)",
             "lat": round(fallback_lat, 4),
             "lon": round(fallback_lon, 4),
-            "role": "🌐 Federated Mesh Peer"
+            "role": "🛰️ Federated Mesh Peer (Auto-Join)"
         }
     return {
         "domain": domain,
@@ -1323,6 +1409,7 @@ def get_node_geo_entry(domain: str, is_local: bool = False) -> dict:
         "status": "ACTIVE / LOCAL" if is_local else "ACTIVE / SYNCED",
         "type": "Local Node" if is_local else "Remote Peer (Tor v3)",
         "protocol_version": 1 if domain in LEGACY_V1_PEERS else 2,
+        "auto_discovered": auto_discovered,
         "health_score": 1
     }
 
@@ -1398,12 +1485,14 @@ def health():
         peer_count = len([p for p in known_peers if p != my_domain])
         total_nodes = peer_count + (1 if my_domain else 0)
         uptime_sec = int(time.time() - start_time)
+        my_geo = get_node_geo_entry(my_domain, is_local=True) if my_domain else None
     return jsonify({
         "status": "healthy",
         "zero_trust_mode": "X25519-ChaCha20-Poly1305 + Ed25519-Auth + ACK-Lock + Anti-Sybil",
         "storage_engine": "ram-volatile-ephemeral-ttl24h",
         "domain": my_domain,
         "node_pubkey": NODE_PUBLIC_KEY_HEX,
+        "geo": my_geo,
         "peers_count": peer_count,
         "total_nodes": total_nodes,
         "queued_messages": total_queued,
@@ -1555,77 +1644,163 @@ def anti_entropy_sync_loop():
                 pass
 
 
+_self_geo_detected = False
+
+
+def _detect_self_geo_if_unknown(current_domain: str):
+    """
+    Automatically detects public IP geolocation on startup when a new node is not in NODE_GEO_METADATA.
+    Falls back cleanly to deterministic non-overlapping coordinates if geolocation API is unreachable.
+    """
+    global _self_geo_detected
+    if _self_geo_detected or not current_domain or current_domain in NODE_GEO_METADATA:
+        _self_geo_detected = True
+        return
+    _self_geo_detected = True
+
+    env_lat = os.getenv("NODE_LAT")
+    env_lon = os.getenv("NODE_LON")
+    if env_lat and env_lon:
+        ok, slat, slon = parse_safe_coords(env_lat, env_lon)
+        if ok:
+            short_id = current_domain[:6]
+            _apply_discovered_geo(current_domain, {
+                "node_name": os.getenv("NODE_NAME", f"🛰️ Nó Auto-Join ({current_domain[:8]}...)"),
+                "map_label": os.getenv("NODE_MAP_LABEL", f"🛰️ Auto • {short_id}"),
+                "location": os.getenv("NODE_LOCATION", "Tor Hidden Service v3 (Auto-Join)"),
+                "provider": os.getenv("NODE_PROVIDER", "Federated Cloud Relay"),
+                "lat": slat,
+                "lon": slon,
+                "role": os.getenv("NODE_ROLE", "🛰️ Auto-Discovered Relay"),
+            })
+            return
+
+    try:
+        r = requests.get(
+            "http://ip-api.com/json/?fields=status,country,countryCode,city,isp,lat,lon",
+            timeout=5,
+        )
+        if r.status_code == 200:
+            info = r.json()
+            if info.get("status") == "success":
+                city = (info.get("city") or "Cloud").strip()
+                country = (info.get("country") or "Global").strip()
+                cc = (info.get("countryCode") or "GL").strip().upper()
+                isp = (info.get("isp") or "Federated Cloud").strip()
+                lat = float(info.get("lat", 0.0))
+                lon = float(info.get("lon", 0.0))
+                # Small deterministic jitter (+-0.6 deg) so multiple nodes in same city never overlap
+                h = int(hashlib.sha256(current_domain.encode("utf-8")).hexdigest()[:6], 16)
+                lat += ((h % 120) - 60) * 0.01
+                lon += (((h >> 8) % 120) - 60) * 0.01
+                short_id = current_domain[:5]
+                _apply_discovered_geo(current_domain, {
+                    "node_name": f"🛰️ Nó Auto ({city}, {cc} • {short_id})",
+                    "map_label": f"🛰️ {city[:10]} ({cc})",
+                    "location": f"{city}, {country} (Auto-Join)",
+                    "provider": f"{isp} (Auto-Discovered)",
+                    "lat": round(lat, 4),
+                    "lon": round(lon, 4),
+                    "role": f"🛰️ Cloud Relay ({cc})",
+                })
+    except Exception:
+        pass
+
+
+def _announce_to_single_seed(seed: str, current_domain: str, payload: dict):
+    path = "/api/v1/peers/announce"
+    session = get_tor_session()
+    try:
+        with lock:
+            has_pubkey = seed in peer_pubkeys
+        if not has_pubkey:
+            h_res = session.get(f"http://{seed}/health", timeout=20)
+            if h_res.status_code == 200:
+                h_body = h_res.json()
+                remote_pk = (h_body.get("node_pubkey") or "").strip().lower()
+                if isinstance(h_body.get("geo"), dict):
+                    _apply_discovered_geo(seed, h_body.get("geo"))
+                if PUBKEY_HEX_REGEX.match(remote_pk):
+                    with lock:
+                        peer_pubkeys[seed] = remote_pk
+
+        body_bytes, headers = build_peer_signed_request("POST", path, payload)
+        res = session.post(
+            f"http://{seed}{path}",
+            data=body_bytes,
+            headers=headers,
+            timeout=20,
+        )
+        if res.status_code == 200:
+            peers = res.json().get("all_peers") or res.json().get("peers", [])
+            for p in peers:
+                p_clean = (p or "").strip().lower()
+                if is_valid_onion_v3(p_clean) and p_clean != current_domain and p_clean not in LEGACY_V1_PEERS:
+                    with lock:
+                        already = p_clean in known_peers
+                        can_more = len(known_peers) < MAX_KNOWN_PEERS
+                    if not already and can_more:
+                        try:
+                            p_health = session.get(f"http://{p_clean}/health", timeout=20)
+                            if p_health.status_code == 200:
+                                p_body = p_health.json()
+                                p_pk = (p_body.get("node_pubkey") or "").strip().lower()
+                                if isinstance(p_body.get("geo"), dict):
+                                    _apply_discovered_geo(p_clean, p_body.get("geo"))
+                                if p_body.get("status") == "healthy":
+                                    with lock:
+                                        if len(known_peers) < MAX_KNOWN_PEERS:
+                                            known_peers.add(p_clean)
+                                            if PUBKEY_HEX_REGEX.match(p_pk):
+                                                peer_pubkeys[p_clean] = p_pk
+                        except Exception:
+                            pass
+            print(
+                f"[*] [MESH-SYNC] Synchronized via {seed[:16]}... "
+                f"({len(known_peers)} active peers)",
+                flush=True,
+            )
+    except Exception as e:
+        print(f"[!] [MESH-WAIT] Waiting for Tor circuit to {seed[:16]}...: {e}", flush=True)
+
+
 def bootstrap_discovery_loop():
     """
-    Continuous autonomous peer discovery & Ed25519-authenticated announce loop over Tor.
+    Continuous autonomous peer discovery & Ed25519-authenticated parallel announce loop over Tor.
     """
+    primary_seeds = [
+        "onion4zr3bsdeaelksemwokl5qmxd5o7jyblf46vc2mfl6cozgw77tqd.onion",
+        "kn4u2xxl2otoo2ujv3mhehwfwbw7mtppaf56fu3nxogvv7eekf2qdrid.onion",
+    ]
     while True:
         current_domain = get_my_onion_domain()
         if not current_domain:
             time.sleep(3)
             continue
 
-        session = get_tor_session()
+        _detect_self_geo_if_unknown(current_domain)
+
         with lock:
-            targets = [
-                p for p in (set(BOOTSTRAP_SEEDS) | known_peers)
-                if p and p != current_domain and p not in LEGACY_V1_PEERS
-            ]
+            all_candidates = (set(BOOTSTRAP_SEEDS) | known_peers) - {current_domain} - LEGACY_V1_PEERS
+            ordered_targets = [s for s in primary_seeds if s in all_candidates]
+            ordered_targets.extend(sorted(all_candidates - set(ordered_targets)))
+            my_geo = get_node_geo_entry(current_domain, is_local=True)
 
-        path = "/api/v1/peers/announce"
-        payload = {"node_onion": current_domain, "node_pubkey": NODE_PUBLIC_KEY_HEX}
+        payload = {
+            "node_onion": current_domain,
+            "node_pubkey": NODE_PUBLIC_KEY_HEX,
+            "geo": my_geo,
+        }
 
-        for seed in targets:
-            try:
-                # Fetch seed's node_pubkey from /health if not yet pinned
-                with lock:
-                    has_pubkey = seed in peer_pubkeys
-                if not has_pubkey:
-                    h_res = session.get(f"http://{seed}/health", timeout=20)
-                    if h_res.status_code == 200:
-                        remote_pk = (h_res.json().get("node_pubkey") or "").strip().lower()
-                        if PUBKEY_HEX_REGEX.match(remote_pk):
-                            with lock:
-                                peer_pubkeys[seed] = remote_pk
+        futures = [
+            gossip_executor.submit(_announce_to_single_seed, seed, current_domain, payload)
+            for seed in ordered_targets
+        ]
+        concurrent.futures.wait(futures, timeout=35)
 
-                body_bytes, headers = build_peer_signed_request("POST", path, payload)
-                res = session.post(
-                    f"http://{seed}{path}",
-                    data=body_bytes,
-                    headers=headers,
-                    timeout=20,
-                )
-                if res.status_code == 200:
-                    peers = res.json().get("all_peers") or res.json().get("peers", [])
-                    for p in peers:
-                        p_clean = (p or "").strip().lower()
-                        if is_valid_onion_v3(p_clean) and p_clean != current_domain and p_clean not in LEGACY_V1_PEERS:
-                            with lock:
-                                already = p_clean in known_peers
-                                can_more = len(known_peers) < MAX_KNOWN_PEERS
-                            if not already and can_more:
-                                try:
-                                    p_health = session.get(f"http://{p_clean}/health", timeout=20)
-                                    if p_health.status_code == 200:
-                                        p_body = p_health.json()
-                                        p_pk = (p_body.get("node_pubkey") or "").strip().lower()
-                                        if p_body.get("status") == "healthy":
-                                            with lock:
-                                                if len(known_peers) < MAX_KNOWN_PEERS:
-                                                    known_peers.add(p_clean)
-                                                    if PUBKEY_HEX_REGEX.match(p_pk):
-                                                        peer_pubkeys[p_clean] = p_pk
-                                except Exception:
-                                    pass
-                    print(
-                        f"[*] [MESH-SYNC] Synchronized via {seed[:16]}... "
-                        f"({len(known_peers)} active peers)",
-                        flush=True,
-                    )
-            except Exception as e:
-                print(f"[!] [MESH-WAIT] Waiting for Tor circuit to {seed[:16]}...: {e}", flush=True)
-
-        time.sleep(90)
+        with lock:
+            pinned_count = len(peer_pubkeys)
+        time.sleep(20 if pinned_count < 2 else 60)
 
 
 if os.getenv("DISABLE_BOOTSTRAP_LOOP") != "1":
