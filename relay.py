@@ -1649,8 +1649,10 @@ _self_geo_detected = False
 
 def _detect_self_geo_if_unknown(current_domain: str):
     """
-    Automatically detects public IP geolocation on startup when a new node is not in NODE_GEO_METADATA.
-    Falls back cleanly to deterministic non-overlapping coordinates if geolocation API is unreachable.
+    Zero-Leak node identity initialization:
+    Never queries external IP/Geolocation APIs (e.g. ip-api.com) and never exposes real latitude/longitude.
+    Uses optional operator-defined environment variables if provided, or falls back to deterministic
+    synthetic coordinates derived solely from the SHA-256 hash of the .onion v3 domain.
     """
     global _self_geo_detected
     if _self_geo_detected or not current_domain or current_domain in NODE_GEO_METADATA:
@@ -1667,44 +1669,13 @@ def _detect_self_geo_if_unknown(current_domain: str):
             _apply_discovered_geo(current_domain, {
                 "node_name": os.getenv("NODE_NAME", f"🛰️ Nó Auto-Join ({current_domain[:8]}...)"),
                 "map_label": os.getenv("NODE_MAP_LABEL", f"🛰️ Auto • {short_id}"),
-                "location": os.getenv("NODE_LOCATION", "Tor Hidden Service v3 (Auto-Join)"),
-                "provider": os.getenv("NODE_PROVIDER", "Federated Cloud Relay"),
+                "location": os.getenv("NODE_LOCATION", "Tor Hidden Service v3 (Anônimo / Zero-Leak)"),
+                "provider": os.getenv("NODE_PROVIDER", "Tor v3 Hidden Service Mesh"),
                 "lat": slat,
                 "lon": slon,
                 "role": os.getenv("NODE_ROLE", "🛰️ Auto-Discovered Relay"),
             })
             return
-
-    try:
-        r = requests.get(
-            "http://ip-api.com/json/?fields=status,country,countryCode,city,isp,lat,lon",
-            timeout=5,
-        )
-        if r.status_code == 200:
-            info = r.json()
-            if info.get("status") == "success":
-                city = (info.get("city") or "Cloud").strip()
-                country = (info.get("country") or "Global").strip()
-                cc = (info.get("countryCode") or "GL").strip().upper()
-                isp = (info.get("isp") or "Federated Cloud").strip()
-                lat = float(info.get("lat", 0.0))
-                lon = float(info.get("lon", 0.0))
-                # Small deterministic jitter (+-0.6 deg) so multiple nodes in same city never overlap
-                h = int(hashlib.sha256(current_domain.encode("utf-8")).hexdigest()[:6], 16)
-                lat += ((h % 120) - 60) * 0.01
-                lon += (((h >> 8) % 120) - 60) * 0.01
-                short_id = current_domain[:5]
-                _apply_discovered_geo(current_domain, {
-                    "node_name": f"🛰️ Nó Auto ({city}, {cc} • {short_id})",
-                    "map_label": f"🛰️ {city[:10]} ({cc})",
-                    "location": f"{city}, {country} (Auto-Join)",
-                    "provider": f"{isp} (Auto-Discovered)",
-                    "lat": round(lat, 4),
-                    "lon": round(lon, 4),
-                    "role": f"🛰️ Cloud Relay ({cc})",
-                })
-    except Exception:
-        pass
 
 
 def _announce_to_single_seed(seed: str, current_domain: str, payload: dict):
