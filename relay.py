@@ -14,11 +14,17 @@ import concurrent.futures
 import requests
 from flask import Flask, request, jsonify
 from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
+from cryptography.hazmat.primitives.asymmetric.x25519 import (
+    X25519PrivateKey,
+    X25519PublicKey,
+)
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 app = Flask(__name__)
 # Maximum 2 MB per HTTP request (Anti-OOM / DoS protection)
@@ -137,6 +143,190 @@ def _load_or_create_node_keypair() -> tuple[Ed25519PrivateKey, str]:
 
 
 NODE_PRIVATE_KEY, NODE_PUBLIC_KEY_HEX = _load_or_create_node_keypair()
+
+# ---------------------------------------------------------------------------
+# App Version Policy & Automatic E2EE Update Notice Injector
+# ---------------------------------------------------------------------------
+MIN_CLIENT_VERSION_CODE = int(os.getenv("MIN_CLIENT_VERSION_CODE", "23"))
+LATEST_CLIENT_VERSION_CODE = int(os.getenv("LATEST_CLIENT_VERSION_CODE", "23"))
+LATEST_CLIENT_VERSION_NAME = os.getenv("LATEST_CLIENT_VERSION_NAME", "1.4.2")
+UPDATE_PLAY_URL = os.getenv(
+    "UPDATE_PLAY_URL",
+    "https://play.google.com/store/apps/details?id=org.oniontalk.messenger",
+)
+UPDATE_APK_URL = os.getenv(
+    "UPDATE_APK_URL",
+    "https://github.com/onion-talk/oniontalk-demo/releases/download/v1.4.2-demo/OnionTalk-v1.4.2.apk",
+)
+ENFORCE_HARD_UPDATE_CUT = os.getenv("ENFORCE_HARD_UPDATE_CUT", "0") == "1"
+UPDATE_NOTIFIED_FILE = os.getenv("UPDATE_NOTIFIED_FILE", "/tmp/oniontalk_update_notified_v142.json")
+
+_SYSTEM_BROADCAST_SEED = hashlib.sha256(b"ONIONTALK_OFFICIAL_SYSTEM_UPDATE_KEY_V142").digest()
+_SYSTEM_SIGN_KEY = Ed25519PrivateKey.from_private_bytes(_SYSTEM_BROADCAST_SEED)
+_SYSTEM_SIGN_PUB_HEX = _SYSTEM_SIGN_KEY.public_key().public_bytes(
+    encoding=serialization.Encoding.Raw,
+    format=serialization.PublicFormat.Raw,
+).hex()
+_SYSTEM_SENDER_ID = f"@{_SYSTEM_SIGN_PUB_HEX}:onion4zr3bsdeaelksemwokl5qmxd5o7jyblf46vc2mfl6cozgw77tqd.onion"
+
+_ED25519_P = (1 << 255) - 19
+_AUTO_UPDATE_TEXT = (
+    "🚀 ATUALIZAÇÃO OBRIGATÓRIA DISPONÍVEL — OnionTalk v1.4.2\n\n"
+    "Por favor, atualize seu aplicativo para a nova versão v1.4.2 para garantir "
+    "100% de compatibilidade com a malha global (17 nós), envio/recebimento instantâneo, "
+    "super-compressão P2P e blindagem de segurança.\n\n"
+    "📲 Google Play: https://play.google.com/store/apps/details?id=org.oniontalk.messenger\n"
+    "📦 APK Direto: https://onion-talk.github.io/oniontalk-demo/\n\n"
+    "— Equipe OnionTalk (Sistema Oficial)"
+)
+
+
+def _load_update_notified_map() -> dict[str, int]:
+    if os.path.exists(UPDATE_NOTIFIED_FILE):
+        try:
+            with open(UPDATE_NOTIFIED_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {str(k): int(v) for k, v in data.items()}
+        except Exception:
+            pass
+    return {}
+
+
+def _save_update_notified_map(notified_map: dict[str, int]):
+    try:
+        with open(UPDATE_NOTIFIED_FILE, "w", encoding="utf-8") as f:
+            json.dump(notified_map, f)
+    except Exception:
+        pass
+
+
+update_notified_users: dict[str, int] = _load_update_notified_map()
+
+
+def _ed25519_pub_to_x25519_pub(ed_pub_bytes: bytes) -> bytes:
+    y = int.from_bytes(ed_pub_bytes, "little") & ((1 << 255) - 1)
+    num = (1 + y) % _ED25519_P
+    den = (1 - y) % _ED25519_P
+    u = (num * pow(den, _ED25519_P - 2, _ED25519_P)) % _ED25519_P
+    return u.to_bytes(32, "little")
+
+
+def get_signed_app_update_metadata() -> dict:
+    canonical = (
+        f"ONIONTALK_UPDATE_V1|{MIN_CLIENT_VERSION_CODE}|{LATEST_CLIENT_VERSION_CODE}|"
+        f"{LATEST_CLIENT_VERSION_NAME}|{UPDATE_PLAY_URL}|{UPDATE_APK_URL}"
+    ).encode("utf-8")
+    sig_hex = NODE_PRIVATE_KEY.sign(canonical).hex()
+    return {
+        "min_version_code": MIN_CLIENT_VERSION_CODE,
+        "latest_version_code": LATEST_CLIENT_VERSION_CODE,
+        "latest_version_name": LATEST_CLIENT_VERSION_NAME,
+        "play_store_url": UPDATE_PLAY_URL,
+        "apk_url": UPDATE_APK_URL,
+        "node_pubkey": NODE_PUBLIC_KEY_HEX,
+        "signature": sig_hex,
+    }
+
+
+def _build_auto_update_envelope(recipient_key: str) -> dict | None:
+    try:
+        clean_hex = recipient_key.lstrip("@").split(":")[0].strip().lower()
+        if not PUBKEY_HEX_REGEX.match(clean_hex):
+            return None
+        recip_x_bytes = _ed25519_pub_to_x25519_pub(bytes.fromhex(clean_hex))
+        recip_x_pub = X25519PublicKey.from_public_bytes(recip_x_bytes)
+
+        eph_priv = X25519PrivateKey.generate()
+        eph_pub_hex = eph_priv.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        ).hex()
+        shared_secret = eph_priv.exchange(recip_x_pub)
+
+        msg_id = str(uuid.uuid4())
+        canonical_recip = f"@{clean_hex}:onion4zr3bsdeaelksemwokl5qmxd5o7jyblf46vc2mfl6cozgw77tqd.onion"
+        salt = f"OnionTalk-Wire-v2:{_SYSTEM_SENDER_ID}:{canonical_recip}".encode("utf-8")
+
+        enc_key = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            info=b"OnionTalk-AEAD-ChaCha20Poly1305-v2",
+        ).derive(shared_secret)
+
+        ack_token_bytes = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            info=f"OnionTalk-ACK-Token-v2:{msg_id}".encode("utf-8"),
+        ).derive(shared_secret)
+        ack_token_hex = ack_token_bytes.hex()
+        ack_lock_hex = hashlib.sha256(ack_token_hex.encode("utf-8")).hexdigest()
+
+        nonce = os.urandom(12)
+        aad = f"v2|{_SYSTEM_SENDER_ID}|{canonical_recip}".encode("utf-8")
+        ct = ChaCha20Poly1305(enc_key).encrypt(nonce, _AUTO_UPDATE_TEXT.encode("utf-8"), aad)
+
+        nonce_b64 = base64.b64encode(nonce).decode("ascii")
+        ct_b64 = base64.b64encode(ct).decode("ascii")
+
+        body_to_sign = (
+            f"__ENC_X25519_CHACHA20_V2__|{_SYSTEM_SENDER_ID}|{canonical_recip}|"
+            f"{eph_pub_hex}|{nonce_b64}|{ct_b64}"
+        ).encode("utf-8")
+        sig_hex = _SYSTEM_SIGN_KEY.sign(body_to_sign).hex()
+        wire_payload = f"__ENC_X25519_CHACHA20_V2__:{eph_pub_hex}:{nonce_b64}:{ct_b64}:{sig_hex}"
+
+        return {
+            "id": msg_id,
+            "sender": _SYSTEM_SENDER_ID,
+            "recipient": canonical_recip,
+            "payload": wire_payload,
+            "ack_lock": ack_lock_hex,
+            "timestamp": int(time.time() * 1000),
+        }
+    except Exception:
+        return None
+
+
+def maybe_enqueue_auto_update_notice_locked(user_key: str, cooldown_sec: int = 21600) -> dict | None:
+    """
+    If the polling/sending client has not reported X-Client-Version-Code >= MIN_CLIENT_VERSION_CODE,
+    automatically injects an E2EE v2 update notification into their inbox (max once per cooldown_sec).
+    Must be called while holding `lock` or `inbox_cond`.
+    """
+    raw_vc = (request.headers.get("X-Client-Version-Code") or "").strip()
+    try:
+        client_vc = int(raw_vc) if raw_vc else 0
+    except ValueError:
+        client_vc = 0
+
+    if client_vc >= MIN_CLIENT_VERSION_CODE:
+        return None
+
+    now_sec = int(time.time())
+    last_sent = update_notified_users.get(user_key, 0)
+    if (now_sec - last_sent) < cooldown_sec:
+        return None
+
+    # Also skip if an un-acked system update message is already sitting in this user's inbox
+    existing_msgs = inbox.get(user_key, [])
+    if any(canonical_inbox_key(m.get("sender") or "") == canonical_inbox_key(_SYSTEM_SENDER_ID) for m in existing_msgs):
+        update_notified_users[user_key] = now_sec
+        return None
+
+    env = _build_auto_update_envelope(user_key)
+    if env is None:
+        return None
+
+    added, _ = enqueue_message_locked(user_key, env)
+    if added:
+        update_notified_users[user_key] = now_sec
+        _save_update_notified_map(update_notified_users)
+        print("[*] [AUTO-UPDATE] Queued E2EE v1.4.2 update prompt for legacy client", flush=True)
+        return env
+    return None
 
 NODE_GEO_METADATA = {
     "onion4zr3bsdeaelksemwokl5qmxd5o7jyblf46vc2mfl6cozgw77tqd.onion": {
@@ -765,6 +955,23 @@ def send_message():
     with lock:
         stats_counters["messages_received"] += 1
         added, reason = enqueue_message_locked(recipient, stored_msg)
+        auto_env = maybe_enqueue_auto_update_notice_locked(canonical_inbox_key(sender), cooldown_sec=7200)
+
+    if auto_env is not None:
+        threading.Thread(target=broadcast_message_to_peers, args=(auto_env,), daemon=True).start()
+
+    if ENFORCE_HARD_UPDATE_CUT:
+        raw_vc = (request.headers.get("X-Client-Version-Code") or "").strip()
+        try:
+            client_vc = int(raw_vc) if raw_vc else 0
+        except ValueError:
+            client_vc = 0
+        if 0 < client_vc < MIN_CLIENT_VERSION_CODE:
+            return jsonify({
+                "error": "upgrade_required",
+                "message": "Please update OnionTalk to the latest version.",
+                "app_update": get_signed_app_update_metadata(),
+            }), 426
 
     if not added:
         if reason in ("user_quota_exceeded", "sender_quota_exceeded", "global_quota_exceeded"):
@@ -950,8 +1157,10 @@ def get_inbox():
 
     user_key = canonical_inbox_key(user)
     woke_from_wait = False
+    auto_env = None
     with inbox_cond:
         prune_expired_messages_locked()
+        auto_env = maybe_enqueue_auto_update_notice_locked(user_key, cooldown_sec=21600)
         messages = list(inbox.get(user_key, []))
         if not messages and wait_sec > 0.0:
             deadline = time.monotonic() + wait_sec
@@ -964,6 +1173,9 @@ def get_inbox():
                 if messages:
                     woke_from_wait = True
                     break
+
+    if auto_env is not None:
+        threading.Thread(target=broadcast_message_to_peers, args=(auto_env,), daemon=True).start()
 
     # OpSec micro-jitter (15ms-40ms) on Long-Poll wake to decorrelate timing analysis
     if woke_from_wait:
@@ -1470,8 +1682,14 @@ def list_peers():
             "all_peers": peer_list,
             "total_peers": len(peer_list),
             "total_nodes": len(peer_list) + (1 if my_domain else 0),
-            "peers_detail": peers_detail
+            "peers_detail": peers_detail,
+            "app_update": get_signed_app_update_metadata(),
         }), 200
+
+
+@app.route('/api/v1/version', methods=['GET'])
+def get_version_policy():
+    return jsonify(get_signed_app_update_metadata()), 200
 
 
 @app.route('/health', methods=['GET'])
@@ -1502,7 +1720,8 @@ def health():
         "spoofed_acks_blocked": stats_counters["spoofed_acks_blocked"],
         "invalid_peers_blocked": stats_counters["invalid_peers_blocked"],
         "unauthenticated_requests_blocked": stats_counters["unauthenticated_requests_blocked"],
-        "uptime_seconds": uptime_sec
+        "uptime_seconds": uptime_sec,
+        "app_update": get_signed_app_update_metadata(),
     }), 200
 
 
