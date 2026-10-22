@@ -51,7 +51,7 @@ DEFAULT_SEEDS = (
     "wfi3nwuzk2tgrsf2scdy4nb6x6rtiocit4n26477zdlvdvshkgip3ayd.onion,"
     "5s6w6556f2eov2p6wlsuavaxh7si2kaswjwi5reojnovbzemducjzjqd.onion,"
     "o5yf3eukrwpt2g6jfo4q2y23xtuhoso2qknmnn6ac5eng5t4yt36roqd.onion,"
-    "o5zqqfl5znzexdojfnxgub5jnjelxdahbyxasjp57sx6fbxtjeqovpad.onion,"
+    "azw5qxf4jnfudeei3nanggojle62g4duoxtxjj2pjuvm42xb3456vjad.onion,"
     "2amizuhb3p5x2lk3sra7f7thm5tgs7qtnysgowqpmexcqi4cuwyv7vad.onion"
 )
 
@@ -64,7 +64,7 @@ RECIPIENT_ID_REGEX = re.compile(r"^@[0-9a-f]{64}(:[a-z2-7]{56}\.onion)?$")
 
 MAX_KNOWN_PEERS = 64
 MAX_INBOX_PER_USER = 500
-MAX_PER_SENDER_INBOX = 250
+MAX_PER_SENDER_INBOX = 50
 MAX_TOTAL_INBOXES = 5000
 MESSAGE_TTL_MS = 24 * 3600 * 1000  # 24 hours
 AUTH_WINDOW_MS = 5 * 60 * 1000     # +/- 5 minutes replay window
@@ -274,7 +274,7 @@ NODE_GEO_METADATA = {
         "lon": 103.8198,
         "role": "🇸🇬 Cloud Relay (Singapura, SG)"
     },
-    "o5zqqfl5znzexdojfnxgub5jnjelxdahbyxasjp57sx6fbxtjeqovpad.onion": {
+    "azw5qxf4jnfudeei3nanggojle62g4duoxtxjj2pjuvm42xb3456vjad.onion": {
         "node_name": "🇩🇪 Nó 16 — DOM Cloud (Alemanha)",
         "map_label": "🇩🇪 N16 • Alemanha",
         "location": "Nuremberg, Alemanha (EU-Central)",
@@ -676,17 +676,15 @@ def enqueue_message_locked(recipient: str, msg_obj: dict) -> tuple[bool, str]:
 
     sender_id = canonical_inbox_key((msg_obj.get("sender") or "").strip().lower())
     if sender_id:
-        sender_indices = [
-            idx for idx, m in enumerate(inbox[recipient_key])
+        sender_count = sum(
+            1 for m in inbox[recipient_key]
             if canonical_inbox_key(m.get("sender") or "") == sender_id
-        ]
-        while len(sender_indices) >= MAX_PER_SENDER_INBOX:
-            evict_idx = sender_indices.pop(0)
-            inbox[recipient_key].pop(evict_idx)
-            sender_indices = [i - 1 for i in sender_indices]
+        )
+        if sender_count >= MAX_PER_SENDER_INBOX:
+            return False, "sender_quota_exceeded"
 
-    while len(inbox[recipient_key]) >= MAX_INBOX_PER_USER:
-        inbox[recipient_key].pop(0)
+    if len(inbox[recipient_key]) >= MAX_INBOX_PER_USER:
+        return False, "user_quota_exceeded"
 
     inbox[recipient_key].append(msg_obj)
     inbox_cond.notify_all()
@@ -1073,8 +1071,9 @@ def acknowledge_messages_batch():
             if removed_count > 0:
                 print(f"[*] [RELAY-BATCH-ACK] {removed_count} envelope(s) purged via verified batch proof", flush=True)
         for mid, tok in token_map.items():
-            if mid in acked_tombstones and mid not in verified_tokens:
-                verified_tokens[mid] = tok
+            saved_tok = acked_tokens.get(mid, "")
+            if mid in acked_tombstones and mid not in verified_tokens and saved_tok and hmac.compare_digest(tok, saved_tok):
+                verified_tokens[mid] = saved_tok
 
     if verified_tokens:
         threading.Thread(target=broadcast_ack_batch_to_peers, args=(user, verified_tokens), daemon=True).start()
@@ -1531,10 +1530,25 @@ def stats():
 
 @app.route('/api/v1/debug/queues', methods=['GET'])
 def debug_queues():
-    """Localhost-only diagnostic endpoint for SRE mesh latency monitoring (never accessible via .onion)."""
+    """
+    Authenticated diagnostic endpoint for SRE mesh latency monitoring.
+    Blocks HTTP Host-header spoofing over Tor by requiring either RELAY_ADMIN_TOKEN
+    or a valid Ed25519 signature from this node's own local NODE_PRIVATE_KEY, and
+    never exposes raw recipient Crypto IDs (uses salted one-way SHA-256 prefixes).
+    """
     host_hdr = (request.host or "").lower().split(":", 1)[0]
     if host_hdr.endswith(".onion") or host_hdr not in ("127.0.0.1", "localhost"):
         return jsonify({"error": "Not Found"}), 404
+
+    admin_hdr = (request.headers.get("X-Admin-Token") or "").strip()
+    is_admin = bool(RELAY_ADMIN_TOKEN) and hmac.compare_digest(admin_hdr, RELAY_ADMIN_TOKEN)
+    if not is_admin:
+        peer_ok, _, peer_pubkey, _ = verify_peer_request(require_known_peer=False)
+        if not (peer_ok and hmac.compare_digest(peer_pubkey, NODE_PUBLIC_KEY_HEX)):
+            with lock:
+                stats_counters["unauthenticated_requests_blocked"] += 1
+            return jsonify({"error": "Not Found"}), 404
+
     now_ms = int(time.time() * 1000)
     with lock:
         prune_expired_messages_locked()
@@ -1543,22 +1557,19 @@ def debug_queues():
             if not msgs:
                 continue
             ages_sec = [round((now_ms - int(m.get("timestamp", now_ms))) / 1000.0, 1) for m in msgs]
+            blinded_hash = hashlib.sha256(f"{NODE_PUBLIC_KEY_HEX}|{u}".encode("utf-8")).hexdigest()[:12]
             queues_summary.append({
-                "recipient": u[:17] + "...",
-                "full_recipient": u,
+                "recipient_hash": f"anon:{blinded_hash}",
                 "count": len(msgs),
                 "min_age_sec": min(ages_sec) if ages_sec else 0,
                 "max_age_sec": max(ages_sec) if ages_sec else 0,
-                "msg_ids": [m.get("id", "")[:8] for m in msgs[-100:]],
             })
         tomb_count = len(acked_tombstones)
-        recent_tombs = [tid[:8] for tid in list(acked_tombstones.keys())[-200:]]
     return jsonify({
         "domain": get_my_onion_domain(),
         "total_queued": sum(q["count"] for q in queues_summary),
         "active_inboxes": len(queues_summary),
         "tombstones_cached": tomb_count,
-        "tombstone_ids": recent_tombs,
         "queues": queues_summary,
     }), 200
 
@@ -1649,10 +1660,9 @@ _self_geo_detected = False
 
 def _detect_self_geo_if_unknown(current_domain: str):
     """
-    Zero-Leak node identity initialization:
-    Never queries external IP/Geolocation APIs (e.g. ip-api.com) and never exposes real latitude/longitude.
-    Uses optional operator-defined environment variables if provided, or falls back to deterministic
-    synthetic coordinates derived solely from the SHA-256 hash of the .onion v3 domain.
+    Applies operator-configured NODE_LAT / NODE_LON coordinates on startup if provided.
+    Never performs clearnet IP geolocation requests (OpSec Zero-Leak); falls back to
+    deterministic SHA-256(.onion) coordinates in get_node_geo_entry().
     """
     global _self_geo_detected
     if _self_geo_detected or not current_domain or current_domain in NODE_GEO_METADATA:
@@ -1669,13 +1679,12 @@ def _detect_self_geo_if_unknown(current_domain: str):
             _apply_discovered_geo(current_domain, {
                 "node_name": os.getenv("NODE_NAME", f"🛰️ Nó Auto-Join ({current_domain[:8]}...)"),
                 "map_label": os.getenv("NODE_MAP_LABEL", f"🛰️ Auto • {short_id}"),
-                "location": os.getenv("NODE_LOCATION", "Tor Hidden Service v3 (Anônimo / Zero-Leak)"),
-                "provider": os.getenv("NODE_PROVIDER", "Tor v3 Hidden Service Mesh"),
+                "location": os.getenv("NODE_LOCATION", "Tor Hidden Service v3 (Auto-Join)"),
+                "provider": os.getenv("NODE_PROVIDER", "Federated Cloud Relay"),
                 "lat": slat,
                 "lon": slon,
                 "role": os.getenv("NODE_ROLE", "🛰️ Auto-Discovered Relay"),
             })
-            return
 
 
 def _announce_to_single_seed(seed: str, current_domain: str, payload: dict):
